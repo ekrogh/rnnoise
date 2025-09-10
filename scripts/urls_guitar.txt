@@ -1,0 +1,9 @@
+# Put one URL per line pointing to legal, open guitar audio or archives.
+# Tip: Large downloads. You can comment lines you don't want.
+
+# NSynth (Google Magenta) – CC BY 4.0 – guitar notes (valid/test subsets smaller)
+https://storage.googleapis.com/magentadata/datasets/nsynth/nsynth-valid.tgz
+https://storage.googleapis.com/magentadata/datasets/nsynth/nsynth-test.tgz
+
+# Medley-solos-DB (Zenodo) – CC BY 4.0 – solo instrument dataset incl. electric guitar
+https://zenodo.org/record/1432913/files/Medley-solos-DB.zip?download=1

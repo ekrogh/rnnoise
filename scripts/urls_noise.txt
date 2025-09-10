@@ -1,0 +1,8 @@
+# Put one URL per line pointing to legal, open interference/noise audio or archives.
+# Tip: Large downloads. You can comment lines you don't want.
+
+# MUSAN (Speech/Noise/Music) – Open for research (non-commercial)
+https://www.openslr.org/resources/17/musan.tar.gz
+
+# DEMAND Noise Dataset – real environmental noises (free for research)
+https://zenodo.org/records/1227121/files/DEMAND_Real_World_Noise_Dataset.zip?download=1
