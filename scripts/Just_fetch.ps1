@@ -32,3 +32,10 @@ Write-Host "Fetching -> GuitarOut=$GuitarOut NoiseOut=$NoiseOut"
 # pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\fetch_real_data.ps1 `
 #   -GuitarUrls .\scripts\urls_guitar.txt -NoiseUrls .\scripts\urls_noise.txt `
 #   -UseParallel -ParallelJobs 8 -FfmpegThreadsPerJob 1
+
+
+# pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\fetch_real_data.ps1 `
+#   -GuitarUrls .\scripts\urls_guitar.txt -GuitarOut .\data\guitar_clean `
+#   -PreferMedleyCsv `
+#   -InstrumentAllowList @('guitar','electric_guitar','acoustic_guitar') `
+#   -UseParallel -ParallelJobs 8 -FfmpegThreadsPerJob 1

@@ -1,17 +1,22 @@
 # Put one URL per line pointing to legal, open guitar audio or archives.
 # Tip: Large downloads. You can comment lines you don't want.
 
-# NSynth (Google Magenta) – CC BY 4.0 – guitar notes (use jsonwav subsets)
-# NSynth json/wav subsets (official links use HTTP and .tar.gz)
-http://download.magenta.tensorflow.org/datasets/nsynth/nsynth-valid.jsonwav.tar.gz
-http://download.magenta.tensorflow.org/datasets/nsynth/nsynth-test.jsonwav.tar.gz
+# Medley-solos-DB (Zenodo) – CC BY 4.0 – solo instrument dataset incl. electric guitar
+# Note: the exact file name on Zenodo can change per version; if 404, open the record in a browser and copy the current file link.
+# https://zenodo.org/records/3464194
+# https://zenodo.org/records/3464194/files/Medley-solos-DB.tar.gz?download=1
+# Archive: https://zenodo.org/records/3464194/files/Medley-solos-DB.tar.gz?download=1
+# Metadata: https://zenodo.org/records/3464194/files/Medley-solos-DB_metadata.csv?download=1
+Archive: https://zenodo.org/records/3464194/files/Medley-solos-DB
+Metadata: https://zenodo.org/records/3464194/files/Medley-solos-DB_metadata
 
 # Alternate guitar-strong dataset (OpenMIC-2018, contains labeled instrument clips incl. guitar)
 # Large file (2.6 GB). If Zenodo returns 404, open the record in a browser and copy the current file link.
 # https://zenodo.org/records/1432913/files/openmic-2018-v1.0.0.tgz?download=1
 
-# Medley-solos-DB (Zenodo) – CC BY 4.0 – solo instrument dataset incl. electric guitar
-# Note: the exact file name on Zenodo can change per version; if 404, open the record in a browser and copy the current file link.
-# https://zenodo.org/records/1432913
+# NSynth (Google Magenta) – CC BY 4.0 – guitar notes (use jsonwav subsets)
+# NSynth json/wav subsets (official links use HTTP and .tar.gz)
+# Archive: http://download.magenta.tensorflow.org/datasets/nsynth/nsynth-valid.jsonwav.tar.gz
+# Archive: http://download.magenta.tensorflow.org/datasets/nsynth/nsynth-test.jsonwav.tar.gz
 
 

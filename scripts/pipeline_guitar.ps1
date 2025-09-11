@@ -119,6 +119,11 @@ if ($UseSynth -and -not $SkipSynth) {
 if (-not (Test-Path $GuitarIn)) { throw "GuitarDir not found: $GuitarIn" }
 if (-not (Test-Path $NoiseIn))  { throw "InterfereDir not found: $NoiseIn" }
 
+#
+# Set-PSDebug -Trace 1
+# or for more detail:
+# Set-PSDebug -Trace 2
+
 # Optional: fetch real data from URL lists (runs before concat), targeting the chosen dirs
 if ($FetchFromUrls) {
   Write-Host "Fetching real audio using URL lists..."
@@ -128,6 +133,8 @@ if ($FetchFromUrls) {
   New-Item -ItemType Directory -Force -Path $NoiseIn  | Out-Null
   & $fetchPs1 -GuitarUrls $GuitarUrls -NoiseUrls $NoiseUrls -GuitarOut $GuitarIn -NoiseOut $NoiseIn -AllowInsecure:$AllowInsecure
 }
+
+# Set-PSDebug -Off
 
 # 4) Concatenate to PCM streams with ffmpeg
 Require-Cmd ffmpeg
