@@ -1,5 +1,5 @@
 <#
-Train RNNoise to pass guitar and suppress other sounds.
+Train RNNoise to pass guitar and suppress other sounds (with optional real-data fetch, duration filtering, summaries, and feature caching).
 
 Examples
 - Synthetic (auto):
@@ -11,14 +11,22 @@ Notes
 - Requires ffmpeg and CMake in PATH.
 - Defaults to CPU-only Torch; pass -CPUOnly:$false to try CUDA if available.
 - DataMode:
-    Auto (default): use data/guitar_clean & data/interfere if WAVs exist, otherwise synthesize.
-    Synthetic: always synthesize into data/guitar_clean and data/interfere.
-    Real: use -GuitarDir and -InterfereDir (any WAVs; resampled to 48 kHz mono).
+  Auto (default): use data/guitar_clean & data/interfere if WAVs exist, otherwise synthesize.
+  Synthetic: always synthesize a small set into data/guitar_clean and data/interfere.
+  Real: use -GuitarDir and -InterfereDir (any WAVs; resampled to 48 kHz mono).
+- Optional real-data fetching: -FetchFromUrls will call fetch_real_data.ps1 with pass-through parameters:
+  -Downloader Auto|Builtin|Aria2c
+  -ShowDownloadProgress
+  -MinSeconds / -MaxSeconds
+  -WriteDatasetSummary
+  -IgnoreAppleResourceForks
+  -PerFileSkipWarnings
+- Feature caching: skips dumping features if speech.pcm/noise.pcm + FeatureCount signature unchanged (override with -ForceRegenFeatures).
 - Artifacts:
-  - features: features.f32
-  - checkpoints: models/checkpoints
-  - exported C weights copied to src/rnnoise_data.[ch]
-  - binaries in build/Release
+  features.f32
+  models/checkpoints
+  models/c/rnnoise_data.[ch] (copied into src/)
+  build/Release/* (rnnoise library + rnnoise_demo.exe)
 #>
 
 param(
@@ -36,9 +44,18 @@ param(
   [string]$GuitarUrls = (Join-Path $PSScriptRoot 'urls_guitar.txt'),
   [string]$NoiseUrls = (Join-Path $PSScriptRoot 'urls_noise.txt'),
   [switch]$AllowInsecure = $false,
+  # Pass-through download/convert tuning for fetch_real_data.ps1
+  [ValidateSet('Auto','Builtin','Aria2c')][string]$Downloader = 'Auto',
+  [switch]$ShowDownloadProgress = $false,
+  [double]$MinSeconds = 0,
+  [double]$MaxSeconds = 0,
+  [switch]$WriteDatasetSummary = $false,
+  [switch]$IgnoreAppleResourceForks = $true,
+  [switch]$PerFileSkipWarnings = $false,
   [int]$Threads = 0,
   [int]$MaxConcatSecondsSpeech = 0,
-  [int]$MaxConcatSecondsNoise = 0
+  [int]$MaxConcatSecondsNoise = 0,
+  [switch]$ForceRegenFeatures = $false
 )
 
 Set-StrictMode -Version Latest
@@ -131,7 +148,21 @@ if ($FetchFromUrls) {
   if (-not (Test-Path $fetchPs1)) { throw "fetch_real_data.ps1 not found at $fetchPs1" }
   New-Item -ItemType Directory -Force -Path $GuitarIn | Out-Null
   New-Item -ItemType Directory -Force -Path $NoiseIn  | Out-Null
-  & $fetchPs1 -GuitarUrls $GuitarUrls -NoiseUrls $NoiseUrls -GuitarOut $GuitarIn -NoiseOut $NoiseIn -AllowInsecure:$AllowInsecure
+  $fetchArgs = @(
+    '-GuitarUrls', $GuitarUrls,
+    '-NoiseUrls', $NoiseUrls,
+    '-GuitarOut', $GuitarIn,
+    '-NoiseOut', $NoiseIn,
+    '-AllowInsecure:$' + $AllowInsecure,
+    '-Downloader', $Downloader,
+    '-MinSeconds', $MinSeconds,
+    '-MaxSeconds', $MaxSeconds,
+    '-IgnoreAppleResourceForks:$' + $IgnoreAppleResourceForks,
+    '-PerFileSkipWarnings:$' + $PerFileSkipWarnings
+  )
+  if ($ShowDownloadProgress) { $fetchArgs += '-ShowDownloadProgress' }
+  if ($WriteDatasetSummary) { $fetchArgs += '-WriteDatasetSummary' }
+  & $fetchPs1 @fetchArgs
 }
 
 # Set-PSDebug -Off
@@ -177,8 +208,38 @@ if (-not (Test-Path $DumpExe)) { throw "dump_features.exe not found after build.
 # 6) Dump features
 Push-Location $RepoRoot
 try {
-  Write-Host "Dumping features ($FeatureCount sequences)..."
-  & $DumpExe .\speech.pcm .\noise.pcm .\features.f32 $FeatureCount
+  $featCache = Join-Path $RepoRoot 'features.cache.json'
+  function Get-DataSignature {
+    param([string]$speechPcm,[string]$noisePcm,[int]$featureCount)
+    $items = @()
+    foreach ($p in @($speechPcm,$noisePcm)) {
+      if (Test-Path $p) {
+        $fi = Get-Item $p
+        $items += "$($fi.FullName)|$($fi.Length)|$($fi.LastWriteTimeUtc.ToFileTimeUtc())"
+      } else {
+        $items += "$p|missing"
+      }
+    }
+    $items += "FeatureCount=$featureCount"
+    $concat = ($items -join ';')
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $bytes = [Text.Encoding]::UTF8.GetBytes($concat)
+    $hash = $sha256.ComputeHash($bytes)
+    -join ($hash | ForEach-Object { $_.ToString('x2') })
+  }
+  $sig = Get-DataSignature -speechPcm (Join-Path $RepoRoot 'speech.pcm') -noisePcm (Join-Path $RepoRoot 'noise.pcm') -featureCount $FeatureCount
+  $prevSig = $null
+  if (-not $ForceRegenFeatures -and (Test-Path $featCache)) {
+    try { $prev = Get-Content $featCache -Raw | ConvertFrom-Json; $prevSig = $prev.signature } catch {}
+  }
+  if (-not $ForceRegenFeatures -and $prevSig -and $prevSig -eq $sig -and (Test-Path (Join-Path $RepoRoot 'features.f32'))) {
+    Write-Host "Skipping feature dump (cache hit). Use -ForceRegenFeatures to override." 
+  } else {
+    Write-Host "Dumping features ($FeatureCount sequences)..."
+    & $DumpExe .\speech.pcm .\noise.pcm .\features.f32 $FeatureCount
+    $cacheObj = [pscustomobject]@{ signature=$sig; feature_count=$FeatureCount; generated_utc=(Get-Date).ToUniversalTime().ToString('o') }
+    $cacheObj | ConvertTo-Json -Depth 5 | Out-File -FilePath $featCache -Encoding UTF8
+  }
 }
 finally { Pop-Location }
 
