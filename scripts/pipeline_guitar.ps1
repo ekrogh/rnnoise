@@ -1,176 +1,19 @@
 <#
-Optional args:
-  - pipeline_guitar.ps1 -FeatureCount 200 -Epochs 10 -BatchSize 64
+Train RNNoise to pass guitar and suppress other sounds.
 
-Notes
-- Requires ffmpeg and CMake in PATH.
-- Defaults to CPU-only Torch; pass -CPUOnly:$false to try CUDA if available.
-- Artifacts:
-  - features: features.f32
-  - checkpoints: models/checkpoints
-  - exported C weights copied to src/rnnoise_data.[ch]
-  - binaries in build/Release
-#>
-  [int]$FeatureCount = 100,
-  [int]$Epochs = 5,
-  [int]$BatchSize = 64,
-  [string]$BuildType = "Release",
-  [switch]$SkipSynth = $false,
-  [switch]$CPUOnly = $true
-)
-$PSNativeCommandUseErrorActionPreference = $true
-
-$RepoRoot = Split-Path -Parent $PSScriptRoot
-Write-Host "Repo root: $RepoRoot"
-
-  <#
-  Quick examples
-    - Synthetic (default auto):
-        .\pipeline_guitar.ps1 -FeatureCount 200 -Epochs 10 -BatchSize 64
-    - Real data (use your WAV folders):
-        .\pipeline_guitar.ps1 -DataMode Real -GuitarDir D:\data\guitar -InterfereDir D:\data\noise -FeatureCount 5000 -Epochs 100
-
-  Notes
-  - Requires ffmpeg and CMake in PATH.
-  - Defaults to CPU-only Torch; pass -CPUOnly:$false to try CUDA if available.
-  - DataMode:
-      Auto (default): use data/guitar_clean & data/interfere if they contain WAVs, otherwise synthesize.
-      Synthetic: always synthesize into data/guitar_clean and data/interfere.
-      Real: use -GuitarDir and -InterfereDir (folders of 48 kHz mono or any WAVs; will be resampled).
-  - Artifacts:
-    - features: features.f32
-    - checkpoints: models/checkpoints
-    - exported C weights copied to src/rnnoise_data.[ch]
-    - binaries in build/Release
-  #>
-Write-Host "--- Usage / Optional args ---"
-Write-Host "  pipeline_guitar.ps1 -FeatureCount 200 -Epochs 10 -BatchSize 64"
-Write-Host "Notes:"
-Write-Host "  - Requires ffmpeg and CMake in PATH."
-Write-Host "  - Defaults to CPU-only Torch; pass -CPUOnly:`$false to try CUDA."
-Write-Host "Artifacts:"
-    [switch]$SkipSynth = $false,
-    [switch]$CPUOnly = $true,
-    [ValidateSet('Auto','Synthetic','Real')] [string]$DataMode = 'Auto',
-    [string]$GuitarDir = '',
-    [string]$InterfereDir = ''
-Write-Host "  - exported C weights copied to src/rnnoise_data.[ch]"
-Write-Host "  - binaries in build/Release"
-
-function Require-Cmd($name) {
-  if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
-    throw "Command '$name' not found in PATH. Please install it."
-  }
-}
-
-# 1) Ensure venv exists and get python path
-  Write-Host "  Synthetic (auto):  pipeline_guitar.ps1 -FeatureCount 200 -Epochs 10 -BatchSize 64"
-  Write-Host "  Real data:          pipeline_guitar.ps1 -DataMode Real -GuitarDir D:\data\guitar -InterfereDir D:\data\noise -FeatureCount 5000 -Epochs 100"
-  Write-Host "Creating venv at $VenvPath"
-  python -m venv $VenvPath
-}
-  Write-Host "  - DataMode: Auto|Synthetic|Real (see header for behavior)."
-$Py = Join-Path $VenvPath 'Scripts/python.exe'
-Write-Host "Using Python: $Py"
-
-# 2) Pip setup and deps
-& $Py -m pip install --upgrade pip
-try { & $Py -m pip config set global.cache-dir "D:/pip-cache" | Out-Null } catch {}
-& $Py -m pip install numpy soundfile tqdm
-  # Resolve input data strategy
-  $DefaultGuitar = Join-Path $RepoRoot 'data/guitar_clean'
-  $DefaultNoise  = Join-Path $RepoRoot 'data/interfere'
-
-  $UseSynth = $false
-  if ($DataMode -eq 'Real' -or ($GuitarDir -ne '' -or $InterfereDir -ne '')) {
-    if ($GuitarDir -eq '' -or $InterfereDir -eq '') { throw "When -DataMode Real, provide both -GuitarDir and -InterfereDir." }
-    $GuitarIn = $GuitarDir
-    $NoiseIn  = $InterfereDir
-    $UseSynth = $false
-  } elseif ($DataMode -eq 'Synthetic') {
-    $GuitarIn = $DefaultGuitar
-    $NoiseIn  = $DefaultNoise
-    $UseSynth = $true
-  } else { # Auto
-    $GuitarIn = $DefaultGuitar
-    $NoiseIn  = $DefaultNoise
-    $hasGuitar = (Test-Path $GuitarIn) -and (Get-ChildItem $GuitarIn -Recurse -Filter *.wav -ErrorAction SilentlyContinue)
-    $hasNoise  = (Test-Path $NoiseIn)  -and (Get-ChildItem $NoiseIn  -Recurse -Filter *.wav -ErrorAction SilentlyContinue)
-    $UseSynth = -not ($hasGuitar -and $hasNoise)
-  }
-
-  # 3) Optional: synthesize small dataset (unless explicitly skipped)
-  if ($UseSynth -and -not $SkipSynth) {
-    Write-Host "Synthesizing guitar/interference WAVs into $DefaultGuitar and $DefaultNoise..."
-    & $Py (Join-Path $RepoRoot 'scripts/synthesize_guitar_data.py')
-    $GuitarIn = $DefaultGuitar
-    $NoiseIn  = $DefaultNoise
-  }
-
-  if (-not (Test-Path $GuitarIn)) { throw "GuitarDir not found: $GuitarIn" }
-  if (-not (Test-Path $NoiseIn))  { throw "InterfereDir not found: $NoiseIn" }
-}
-
-# 3) Optional: synthesize small dataset
-if (-not $SkipSynth) {
-  Write-Host "Synthesizing guitar/interference WAVs..."
-  & $Py (Join-Path $RepoRoot 'scripts/synthesize_guitar_data.py')
-}
-    Get-ChildItem $GuitarIn -Recurse -Filter *.wav | ForEach-Object { "file '$( $_.FullName )'" } | Set-Content -Encoding ASCII $speechList
-    Get-ChildItem $NoiseIn  -Recurse -Filter *.wav | ForEach-Object { "file '$( $_.FullName )'" } | Set-Content -Encoding ASCII $noiseList
-Require-Cmd ffmpeg
-Push-Location $RepoRoot
-try {
-  $speechList = Join-Path $RepoRoot 'list_speech.txt'
-  $noiseList  = Join-Path $RepoRoot 'list_noise.txt'
-  Get-ChildItem .\data\guitar_clean -Recurse -Filter *.wav | ForEach-Object { "file '$( $_.FullName )'" } | Set-Content -Encoding ASCII $speechList
-  Get-ChildItem .\data\interfere   -Recurse -Filter *.wav | ForEach-Object { "file '$( $_.FullName )'" } | Set-Content -Encoding ASCII $noiseList
-
-  if (-not (Test-Path $speechList) -or -not (Get-Content $speechList)) { throw "No WAVs in data/guitar_clean." }
-  if (-not (Test-Path $noiseList)  -or -not (Get-Content $noiseList))  { throw "No WAVs in data/interfere." }
-
-  Write-Host "Building speech.pcm ..."
-  ffmpeg -y -f concat -safe 0 -i $speechList -f s16le -acodec pcm_s16le -ar 48000 -ac 1 .\speech.pcm | Out-Null
-  Write-Host "Building noise.pcm ..."
-  ffmpeg -y -f concat -safe 0 -i $noiseList  -f s16le -acodec pcm_s16le -ar 48000 -ac 1 .\noise.pcm | Out-Null
-}
-finally { Pop-Location }
-
-# 5) Build dump_features tool
-$BuildDir = Join-Path $RepoRoot 'build'
-Write-Host "Configuring CMake with tools and examples..."
-cmake -S $RepoRoot -B $BuildDir -DBUILD_TOOLS=ON -DBUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=$BuildType | Out-Null
-Write-Host "Building dump_features..."
-cmake --build $BuildDir --config $BuildType --target dump_features | Out-Null
-
-$DumpExe = Join-Path $BuildDir (Join-Path $BuildType 'dump_features.exe')
-if (-not (Test-Path $DumpExe)) { $DumpExe = Join-Path $BuildDir 'dump_features.exe' }
-if (-not (Test-Path $DumpExe)) { throw "dump_features.exe not found after build." }
-
-# 6) Dump features
-Push-Location $RepoRoot
-try {
-  Write-Host "Dumping features ($FeatureCount sequences)..."
-  & $DumpExe .\speech.pcm .\noise.pcm .\features.f32 $FeatureCount
-}
-finally { Pop-Location }
-
-# 7) Train model (PyTorch)
-$ModelsDir = Join-Path $RepoRoot 'models'
-<#
-Quick examples
-  - Synthetic (auto):
-      .\pipeline_guitar.ps1 -FeatureCount 200 -Epochs 10 -BatchSize 64
-  - Real data (use your WAV folders):
-      .\pipeline_guitar.ps1 -DataMode Real -GuitarDir D:\data\guitar -InterfereDir D:\data\noise -FeatureCount 5000 -Epochs 100
+Examples
+- Synthetic (auto):
+    .\pipeline_guitar.ps1 -FeatureCount 200 -Epochs 10 -BatchSize 64
+- Real data (use your WAV folders):
+    .\pipeline_guitar.ps1 -DataMode Real -GuitarDir D:\data\guitar -InterfereDir D:\data\noise -FeatureCount 5000 -Epochs 100
 
 Notes
 - Requires ffmpeg and CMake in PATH.
 - Defaults to CPU-only Torch; pass -CPUOnly:$false to try CUDA if available.
 - DataMode:
-    Auto (default): use data/guitar_clean & data/interfere if they contain WAVs, otherwise synthesize.
+    Auto (default): use data/guitar_clean & data/interfere if WAVs exist, otherwise synthesize.
     Synthetic: always synthesize into data/guitar_clean and data/interfere.
-    Real: use -GuitarDir and -InterfereDir (folders of WAVs; will be resampled to 48 kHz mono).
+    Real: use -GuitarDir and -InterfereDir (any WAVs; resampled to 48 kHz mono).
 - Artifacts:
   - features: features.f32
   - checkpoints: models/checkpoints
@@ -191,7 +34,11 @@ param(
   [string]$InterfereDir = '',
   [switch]$FetchFromUrls = $false,
   [string]$GuitarUrls = (Join-Path $PSScriptRoot 'urls_guitar.txt'),
-  [string]$NoiseUrls = (Join-Path $PSScriptRoot 'urls_noise.txt')
+  [string]$NoiseUrls = (Join-Path $PSScriptRoot 'urls_noise.txt'),
+  [switch]$AllowInsecure = $false,
+  [int]$Threads = 0,
+  [int]$MaxConcatSecondsSpeech = 0,
+  [int]$MaxConcatSecondsNoise = 0
 )
 
 Set-StrictMode -Version Latest
@@ -207,7 +54,7 @@ Write-Host "  Real data:         pipeline_guitar.ps1 -DataMode Real -GuitarDir D
 Write-Host "Notes:"
 Write-Host "  - Requires ffmpeg and CMake in PATH."
 Write-Host "  - Defaults to CPU-only Torch; pass -CPUOnly:`$false to try CUDA."
-Write-Host "  - DataMode: Auto|Synthetic|Real (see header for behavior)."
+Write-Host "  - DataMode: Auto|Synthetic|Real (see header)."
 Write-Host "  - Optional fetch: -FetchFromUrls to download from URL lists before training."
 Write-Host "Artifacts:"
 Write-Host "  - features: features.f32"
@@ -277,10 +124,9 @@ if ($FetchFromUrls) {
   Write-Host "Fetching real audio using URL lists..."
   $fetchPs1 = Join-Path $RepoRoot 'scripts/fetch_real_data.ps1'
   if (-not (Test-Path $fetchPs1)) { throw "fetch_real_data.ps1 not found at $fetchPs1" }
-  # Decide output destinations: if using real or default dirs, ensure they exist
   New-Item -ItemType Directory -Force -Path $GuitarIn | Out-Null
   New-Item -ItemType Directory -Force -Path $NoiseIn  | Out-Null
-  & powershell -ExecutionPolicy Bypass -File $fetchPs1 -GuitarUrls $GuitarUrls -NoiseUrls $NoiseUrls -GuitarOut $GuitarIn -NoiseOut $NoiseIn
+  & $fetchPs1 -GuitarUrls $GuitarUrls -NoiseUrls $NoiseUrls -GuitarOut $GuitarIn -NoiseOut $NoiseIn -AllowInsecure:$AllowInsecure
 }
 
 # 4) Concatenate to PCM streams with ffmpeg
@@ -295,17 +141,25 @@ try {
   if (-not (Test-Path $speechList) -or -not (Get-Content $speechList)) { throw "No WAVs in $GuitarIn." }
   if (-not (Test-Path $noiseList)  -or -not (Get-Content $noiseList))  { throw "No WAVs in $NoiseIn." }
 
+  $ffCommon = @('-hide_banner','-loglevel','error')
+  $ffThreads = @(); if ($Threads -ge 0) { $ffThreads = @('-threads', "$Threads") }
   Write-Host "Building speech.pcm ..."
-  ffmpeg -y -f concat -safe 0 -i $speechList -f s16le -acodec pcm_s16le -ar 48000 -ac 1 .\speech.pcm | Out-Null
+  $speechArgs = @('-y','-f','concat','-safe','0','-i', $speechList) + $ffCommon
+  if ($MaxConcatSecondsSpeech -gt 0) { $speechArgs += @('-t', "$MaxConcatSecondsSpeech") }
+  $speechArgs += @('-f','s16le','-acodec','pcm_s16le','-ar','48000','-ac','1') + $ffThreads + @('.\speech.pcm')
+  ffmpeg @speechArgs | Out-Null
   Write-Host "Building noise.pcm ..."
-  ffmpeg -y -f concat -safe 0 -i $noiseList  -f s16le -acodec pcm_s16le -ar 48000 -ac 1 .\noise.pcm | Out-Null
+  $noiseArgs = @('-y','-f','concat','-safe','0','-i', $noiseList) + $ffCommon
+  if ($MaxConcatSecondsNoise -gt 0) { $noiseArgs += @('-t', "$MaxConcatSecondsNoise") }
+  $noiseArgs += @('-f','s16le','-acodec','pcm_s16le','-ar','48000','-ac','1') + $ffThreads + @('.\noise.pcm')
+  ffmpeg @noiseArgs | Out-Null
 }
 finally { Pop-Location }
 
 # 5) Build dump_features tool
 $BuildDir = Join-Path $RepoRoot 'build'
-Write-Host "Configuring CMake with tools..."
-cmake -S $RepoRoot -B $BuildDir -DBUILD_TOOLS=ON -DCMAKE_BUILD_TYPE=$BuildType | Out-Null
+Write-Host "Configuring CMake with tools and examples..."
+cmake -S $RepoRoot -B $BuildDir -DBUILD_TOOLS=ON -DBUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=$BuildType | Out-Null
 Write-Host "Building dump_features..."
 cmake --build $BuildDir --config $BuildType --target dump_features | Out-Null
 
