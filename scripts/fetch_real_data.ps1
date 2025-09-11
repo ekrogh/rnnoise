@@ -29,7 +29,8 @@ param(
   [int]$ParallelJobs = 4,
   [int]$FfmpegThreadsPerJob = 1,
   [switch]$PreferMedleyCsv = $true,
-  [string[]]$InstrumentAllowList = @('guitar','electric_guitar','acoustic_guitar')
+  [string[]]$InstrumentAllowList = @('guitar','electric_guitar','acoustic_guitar'),
+  [switch]$ValidateBeforeConvert = $true
 )
 
 Set-StrictMode -Version Latest
@@ -118,7 +119,11 @@ if (-not $NoiseOut  -or $NoiseOut  -eq '') { $NoiseOut  = Join-Path $RepoRoot 'd
 New-Item -ItemType Directory -Force -Path $GuitarOut | Out-Null
 New-Item -ItemType Directory -Force -Path $NoiseOut  | Out-Null
 
-$dlRoot = if ($TempDownloadDir -and $TempDownloadDir -ne '') { New-Item -ItemType Directory -Force -Path $TempDownloadDir } else { New-TempDir 'rnnoise-dl' }
+# Determine download root. By default, persist inside repo so downloads are cached across runs.
+if (-not $TempDownloadDir -or $TempDownloadDir -eq '') {
+  $TempDownloadDir = Join-Path $RepoRoot 'data/_downloads'
+}
+$dlRoot = New-Item -ItemType Directory -Force -Path $TempDownloadDir
 
 try {
   $audioExt = @('.wav','.flac','.mp3','.ogg','.m4a','.aiff','.aif','.aifc')
@@ -194,14 +199,15 @@ try {
   }
 
   function Download-And-Collect([string[]]$urls, [string]$subset) {
-  $outputs = @()
-  $okCount = 0
-  $failCount = 0
+    $outputs = @()
+    $okCount = 0
+    $failCount = 0
     $subsetDir = Join-Path $dlRoot.FullName $subset
     New-Item -ItemType Directory -Force -Path $subsetDir | Out-Null
     $i = 0
     foreach ($u in $urls) {
       $i++
+      if (-not $u -or $u.Trim() -eq '') { continue }
       $fname = Get-SafeFileName $u $i
       $dest = Join-Path $subsetDir $fname
       Write-Host "Downloading [$subset] $u"
@@ -210,7 +216,6 @@ try {
       foreach ($cand in $variants) {
         if ($cand -ne $u) { Write-Warning "Trying alternate: $cand" }
         $dest = Join-Path $subsetDir (Get-SafeFileName $cand $i)
-        # Reuse existing downloaded file if present and non-empty
         if (Test-Path $dest -PathType Leaf) {
           try { $sz = (Get-Item $dest).Length } catch { $sz = 0 }
           if ($sz -gt 0) { Write-Host "Reusing existing: $dest"; $ok = $true; break }
@@ -218,16 +223,13 @@ try {
         if (Invoke-Download $cand $dest) { $ok = $true; break }
       }
       if (-not $ok) { $failCount++; continue }
-
       $l = $dest.ToLower()
       if ($audioExt | Where-Object { $l.EndsWith($_) }) {
         $outputs += $dest; $okCount++
       } elseif ($l.EndsWith('.zip')) {
-        # Use deterministic extraction dir per source file to support reuse across runs
         $zipHash = [Math]::Abs(($dest).GetHashCode())
         $zipOut = Join-Path $subsetDir ("unzip_" + $zipHash)
         New-Item -ItemType Directory -Force -Path $zipOut | Out-Null
-        # If already extracted and audio present, reuse; else extract
         $found = @()
         if (Test-Path $zipOut) {
           $found = (Get-ChildItem $zipOut -Recurse -ErrorAction SilentlyContinue | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
@@ -239,11 +241,9 @@ try {
         if ($found) { $outputs += $found; $okCount++ } else { $failCount++ }
       } elseif ($l.EndsWith('.tar.gz') -or $l.EndsWith('.tgz')) {
         if (Get-Command tar -ErrorAction SilentlyContinue) {
-          # Deterministic extraction dir per source file
           $tarHash = [Math]::Abs(($dest).GetHashCode())
           $tarOut = Join-Path $subsetDir ("untar_" + $tarHash)
           New-Item -ItemType Directory -Force -Path $tarOut | Out-Null
-          # If already extracted and audio present, reuse; else extract
           $found = @()
           if (Test-Path $tarOut) {
             $found = (Get-ChildItem $tarOut -Recurse -ErrorAction SilentlyContinue | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
@@ -257,7 +257,6 @@ try {
           Write-Warning "tar not available; skipping archive $dest"; $failCount++
         }
       } elseif ($l.EndsWith('.csv')) {
-        # Metadata CSV (e.g., Medley-solos-DB). Keep it for later filtering but do not count as failure.
         Write-Host "Metadata CSV detected (not audio): $dest"
       } else {
         Write-Warning "Unsupported file type: $dest"; $failCount++
@@ -349,6 +348,11 @@ try {
   function Convert-To-48kMono([string[]]$files, [string]$outDir) {
     $ffCommon = @('-hide_banner','-loglevel','error','-nostdin','-threads',"$FfmpegThreadsPerJob")
     $ts = Get-Date -Format yyyyMMddHHmmss
+    $validated = 0
+    $canProbe = $ValidateBeforeConvert -and (Get-Command ffprobe -ErrorAction SilentlyContinue)
+    $skipLog = Join-Path $outDir "_skipped_invalid.txt"
+    if (Test-Path $skipLog) { Remove-Item $skipLog -Force -ErrorAction SilentlyContinue }
+    if ($ValidateBeforeConvert -and -not $canProbe) { Write-Host "Validation requested but ffprobe not found; proceeding without pre-validation." }
     if ($UseParallel -and $PSVersionTable.PSVersion.Major -ge 7) {
       $throttle = if ($ParallelJobs -gt 0) { $ParallelJobs } else { 4 }
       $files | ForEach-Object -Parallel {
@@ -356,6 +360,12 @@ try {
         if (-not (Test-Path $f -PathType Leaf)) { Write-Warning "Skip (missing): $f"; return }
         try { $len = (Get-Item $f).Length } catch { $len = 0 }
         if (-not $len -or $len -le 0) { Write-Warning "Skip (empty): $f"; return }
+        if ($using:ValidateBeforeConvert -and $using:canProbe) {
+          try {
+            $probe = & ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=nk=1:nw=1 "$f" 2>$null
+            if (-not $probe -or $probe.Trim() -eq '') { Write-Warning "Skip (no audio stream): $f"; Add-Content -Path $using:skipLog -Value $f; return }
+          } catch { Write-Warning "Skip (probe failed): $f"; Add-Content -Path $using:skipLog -Value $f; return }
+        }
         # generate a unique index per file using its hash and a random salt
         $salt = Get-Random -Minimum 1000 -Maximum 9999
         $name = [IO.Path]::GetFileNameWithoutExtension($f)
@@ -377,6 +387,12 @@ try {
         if (-not (Test-Path $f -PathType Leaf)) { Write-Warning "Skip (missing): $f"; continue }
         try { $len = (Get-Item $f).Length } catch { $len = 0 }
         if (-not $len -or $len -le 0) { Write-Warning "Skip (empty): $f"; continue }
+        if ($ValidateBeforeConvert -and $canProbe) {
+          try {
+            $probe = & ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=nk=1:nw=1 "$f" 2>$null
+            if (-not $probe -or $probe.Trim() -eq '') { Write-Warning "Skip (no audio stream): $f"; Add-Content -Path $skipLog -Value $f; continue }
+          } catch { Write-Warning "Skip (probe failed): $f"; Add-Content -Path $skipLog -Value $f; continue }
+        }
         $out = Join-Path $outDir ("${ts}_$count.wav")
         $args = @('-y') + $ffCommon + @('-i', $f, '-ac','1','-ar','48000', $out)
         try {
@@ -386,6 +402,14 @@ try {
           Write-Warning "ffmpeg failed on: $f ($_). Skipping."
           if (Test-Path $out) { try { Remove-Item $out -Force -ErrorAction SilentlyContinue } catch {} }
         }
+      }
+    }
+    if ($ValidateBeforeConvert -and $canProbe) {
+      $skipped = @()
+      if (Test-Path $skipLog) { $skipped = Get-Content $skipLog | Sort-Object -Unique }
+      Write-Host "Validation summary: converted files may have been reduced; skipped invalid/corrupt=$($skipped.Count)"
+      if ($skipped.Count -gt 0) {
+        Write-Host "First 10 skipped examples:"; $skipped | Select-Object -First 10 | ForEach-Object { Write-Host "  $_" }
       }
     }
   }
@@ -398,7 +422,6 @@ try {
   Write-Host " - Noise:  $NoiseOut"
 }
 finally {
-  if (-not $TempDownloadDir -or $TempDownloadDir -eq '') {
-    if ($dlRoot -and (Test-Path $dlRoot.FullName)) { Remove-Item $dlRoot.FullName -Recurse -Force }
-  }
+  # Intentionally keep download directory ($TempDownloadDir) to allow reuse / caching.
+  # No cleanup performed here.
 }
