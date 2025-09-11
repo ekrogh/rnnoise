@@ -23,7 +23,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\pipeline_guitar.ps1 `
   -DataMode Auto `
   -MinSeconds 1 -MaxSeconds 10 `
   -WriteDatasetSummary `
-  -FeatureCount 200 -Epochs 1 -BatchSize 64
+  -FeatureCount 5000 -Epochs 100 -BatchSize 64
 
 # & $PipelineGuitarPs1 -DataMode Real -GuitarDir $GuitarOut -InterfereDir $InterfereDir -FetchFromUrls -Threads 0 -MaxConcatSecondsSpeech 600 -MaxConcatSecondsNoise 600  -FeatureCount 5000 -Epochs 10 -BatchSize 128
 # & $PipelineGuitarPs1 -DataMode Real -GuitarDir $GuitarOut -InterfereDir $InterfereDir -FetchFromUrls -Threads 0  -FeatureCount 5000 -Epochs 100

@@ -34,175 +34,108 @@ Downloader (aria2c) Tuning
   -AriaMinSplitSizeMB <int>           Minimum size per split before further splitting (default 5)
   Install aria2c:  winget install aria2   OR   choco install aria2
   If aria2c fails or is unavailable the script falls back transparently to builtin.
-
-Skip / Validation Behavior
-  - Pre-validation uses ffprobe to ensure first audio stream exists.
-  - Skipped file reasons aggregated to:
-       _skipped_no_audio.txt
-       _skipped_invalid.txt
-       _skipped_duration.txt
-  - Zero converted outputs -> script throws with reason summary.
-
-Dataset Summary JSON Fields
-  label, file_count, total_seconds, average_seconds, median_seconds, min_seconds, max_seconds, sample_rates, generated_utc
-
-Examples
-  Basic auto fetch + convert only:
-    .\fetch_real_data.ps1 -GuitarUrls scripts\urls_guitar.txt -NoiseUrls scripts\urls_noise.txt
-  With duration filtering & summaries:
-    .\fetch_real_data.ps1 -GuitarUrls scripts\urls_guitar.txt -NoiseUrls scripts\urls_noise.txt -MinSeconds 1 -MaxSeconds 10 -WriteDatasetSummary
-  Summaries only (existing WAV folders, no new download):
-    .\fetch_real_data.ps1 -WriteDatasetSummary -GuitarOut data\guitar_clean -NoiseOut data\interfere
 #>
 
 param(
-  [string]$GuitarUrls = '',
-  [string]$NoiseUrls = '',
-  [string]$GuitarOut = "",
-  [string]$NoiseOut = "",
-  [string]$TempDownloadDir = "",
-  [switch]$AllowInsecure = $false,
-  [switch]$UseParallel = $true,
-  [int]$ParallelJobs = 4,
-  [int]$FfmpegThreadsPerJob = 1,
-  [switch]$PreferMedleyCsv = $true,
-  [string[]]$InstrumentAllowList = @('guitar','electric_guitar','acoustic_guitar'),
-  [switch]$ValidateBeforeConvert = $true,
+  [string]$GuitarUrls,
+  [string]$NoiseUrls,
+  [string]$GuitarOut = (Join-Path (Resolve-Path .).Path 'data/guitar_clean'),
+  [string]$NoiseOut  = (Join-Path (Resolve-Path .).Path 'data/interfere'),
   [ValidateSet('Auto','Builtin','Aria2c')][string]$Downloader = 'Auto',
+  [switch]$ShowDownloadProgress,
+  [int]$MinSeconds = 0,
+  [int]$MaxSeconds = 0,
+  [switch]$WriteDatasetSummary,
+  [switch]$IgnoreAppleResourceForks = $true,
+  [switch]$PerFileSkipWarnings,
+  [switch]$AllowInsecure,
   [int]$AriaMaxConnections = 16,
   [int]$AriaSplit = 16,
   [int]$AriaMinSplitSizeMB = 5,
-  [switch]$ShowDownloadProgress = $false,
-  [switch]$PerFileSkipWarnings = $false,
-  [double]$MinSeconds = 0,
-  [double]$MaxSeconds = 0,
-  [switch]$WriteDatasetSummary = $false,
-  [switch]$IgnoreAppleResourceForks = $true
-
+  [switch]$LenientArchiveValidation,
+  [switch]$TrustGzipIfLarge,
+  [int]$LargeArchiveTrustMB = 900,  # trust very large tarballs if gzip header ok
+  [switch]$ValidateBeforeConvert,
+  [switch]$UseParallel,
+  [int]$ParallelJobs = 0,
+  [int]$FfmpegThreadsPerJob = 1,
+  [switch]$PreferMedleyCsv,
+  [string[]]$InstrumentAllowList,
+  [string]$TempDownloadDir
 )
 
 Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$PSNativeCommandUseErrorActionPreference = $true
+$ErrorActionPreference = 'Continue'
 
-# Track label hints from URL files (so we can infer missing extensions)
-$script:ArchiveHints  = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-$script:MetadataHints = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-
-function Require-Cmd($name) {
-  if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
-    throw "Command '$name' not found in PATH. Please install it."
-  }
-}
-
-function New-TempDir([string]$prefix) {
-  $d = Join-Path ([IO.Path]::GetTempPath()) ("$prefix-" + [guid]::NewGuid())
-  return (New-Item -ItemType Directory -Path $d)
-}
-
-function Read-Urls([string]$file) {
-  if (-not (Test-Path $file)) { return @() }
-  $lines = Get-Content $file | Where-Object { $_ -and $_.Trim() -ne '' -and -not $_.Trim().StartsWith('#') }
-  $urls = @()
-  foreach ($line in $lines) {
-    $t = $line.Trim()
-    # Support optional labels like "Archive:" or "Metadata:" before the URL
-    $m = [regex]::Match($t, '^(?:(?<label>Archive|Metadata)\s*:\s*)?(?<url>https?://.+)$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    if ($m.Success) { $urls += $m.Groups['url'].Value }
-    else { $urls += $t }
-    if ($m.Success -and $m.Groups['label'].Success) {
-      $u = $m.Groups['url'].Value
-      $lab = $m.Groups['label'].Value.ToLower()
-      if ($lab -eq 'archive') { [void]$script:ArchiveHints.Add($u) }
-      elseif ($lab -eq 'metadata') { [void]$script:MetadataHints.Add($u) }
-    }
-  }
-  return $urls
-}
-
-# Build a safe local filename from a URL (strip query string, invalid chars)
-function Get-SafeFileName([string]$url, [int]$index) {
-  try {
-    $uri = [Uri]$url
-    $fname = [IO.Path]::GetFileName($uri.AbsolutePath)
-  } catch { $fname = $null }
-  if (-not $fname -or $fname.Trim() -eq '') { $fname = "file_$index" }
-  # Decode percent-encoding, then remove invalid filename characters
-  try { $fname = [Uri]::UnescapeDataString($fname) } catch {}
-  $invalid = [IO.Path]::GetInvalidFileNameChars()
-  foreach ($ch in $invalid) { $fname = $fname.Replace($ch, '_') }
-  return $fname
-}
-
-Require-Cmd ffmpeg
-
-# Prefer TLS 1.2 for HTTPS downloads (fixes many 403/SSL issues on older defaults)
 try {
-  $tls12 = [Net.SecurityProtocolType]::Tls12
-  if (([Net.ServicePointManager]::SecurityProtocol -band $tls12) -eq 0) {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor $tls12
-  }
-  if ($AllowInsecure) {
-    # As a last resort, trust all certs (older PowerShell versions don't support -SkipCertificateCheck)
+  # ---------------------------------------------------------------------------
+  # Initial setup
+  # ---------------------------------------------------------------------------
+  if (-not $TempDownloadDir) { $TempDownloadDir = Join-Path (Resolve-Path .).Path 'data/_downloads' }
+  if (-not (Test-Path $TempDownloadDir)) { New-Item -ItemType Directory -Path $TempDownloadDir -Force | Out-Null }
+  $dlRoot = Get-Item $TempDownloadDir
+
+  if (-not (Test-Path $GuitarOut)) { New-Item -ItemType Directory -Force -Path $GuitarOut | Out-Null }
+  if (-not (Test-Path $NoiseOut)) { New-Item -ItemType Directory -Force -Path $NoiseOut | Out-Null }
+
+  # Audio extensions recognized as single audio files (lowercase compare)
+  $audioExt = @('.wav','.flac','.mp3','.ogg','.m4a','.aiff','.aif','.aac')
+
+  # Hint sets for variant generation
+  $script:ArchiveHints  = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
+  $script:MetadataHints = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
+
+  function Get-SafeFileName([string]$url,[int]$index) {
+    $raw = $url
     try {
-      add-type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public static class TrustAllCertsPolicy {
-    public static void Enable() {
-        ServicePointManager.ServerCertificateValidationCallback =
-            delegate(object s, X509Certificate certificate, X509Chain chain, System.Net.Security.SslPolicyErrors sslPolicyErrors) { return true; };
-    }
-}
-"@
-      [TrustAllCertsPolicy]::Enable()
-      Write-Warning "AllowInsecure enabled: SSL certificate validation is disabled for this process. Use only on trusted networks/sources."
+      $uObj = [Uri]$url
+      $raw = $uObj.Segments[-1]
+      if (-not $raw) { $raw = $uObj.AbsolutePath.Trim('/') }
     } catch {}
+    if (-not $raw -or $raw.Trim() -eq '') { $raw = "f$index" }
+    # Strip query
+    if ($raw -match '^(?<base>[^?]+)') { $raw = $Matches['base'] }
+    # Replace invalid chars
+    $raw = ($raw -replace '[^A-Za-z0-9_.-]','_')
+    if ($raw.Length -gt 160) { $raw = $raw.Substring(0,160) }
+    return $raw
   }
-} catch {}
 
-$RepoRoot = Split-Path -Parent $PSScriptRoot
-if (-not $GuitarOut -or $GuitarOut -eq '') { $GuitarOut = Join-Path $RepoRoot 'data/guitar_clean' }
-if (-not $NoiseOut  -or $NoiseOut  -eq '') { $NoiseOut  = Join-Path $RepoRoot 'data/interfere' }
-New-Item -ItemType Directory -Force -Path $GuitarOut | Out-Null
-New-Item -ItemType Directory -Force -Path $NoiseOut  | Out-Null
-
-# Resolve downloader mode early (will be used later when refactoring download function)
-$script:DownloaderMode = 'Builtin'
-switch ($Downloader) {
-  'Auto' {
-    if (Get-Command aria2c -ErrorAction SilentlyContinue) {
-      $script:DownloaderMode = 'Aria2c'
-      Write-Host "Downloader: aria2c (auto-detected)"
-    } else {
-      $script:DownloaderMode = 'Builtin'
-      Write-Host "Downloader: builtin (aria2c not found)"
+  function Read-Urls([string]$file) {
+    if (-not (Test-Path $file -PathType Leaf)) { throw "URL list not found: $file" }
+    $lines = Get-Content $file | Where-Object { $_ -and $_.Trim() -ne '' -and -not ($_.Trim().StartsWith('#')) }
+    $urls = @()
+    $i = 0
+    foreach ($l in $lines) {
+      $i++
+      $label = $null; $u = $l.Trim()
+      if ($u -match '^(?i)(Archive|Metadata):\s*(?<rest>.+)$') {
+        $label = $Matches[1]; $u = $Matches['rest'].Trim()
+      }
+      if ($label -eq 'Archive') { $script:ArchiveHints.Add($u)   | Out-Null }
+      if ($label -eq 'Metadata') { $script:MetadataHints.Add($u) | Out-Null }
+      $urls += $u
     }
+    return ,$urls
   }
-  'Builtin' {
-    $script:DownloaderMode = 'Builtin'
-    Write-Host "Downloader: builtin (requested)"
-  }
-  'Aria2c' {
-    if (Get-Command aria2c -ErrorAction SilentlyContinue) {
-      $script:DownloaderMode = 'Aria2c'
-      Write-Host "Downloader: aria2c (requested)"
-    } else {
-      Write-Warning "Downloader 'Aria2c' requested but aria2c not found; falling back to builtin."
-      $script:DownloaderMode = 'Builtin'
-    }
-  }
-}
 
-# Determine download root. By default, persist inside repo so downloads are cached across runs.
-if (-not $TempDownloadDir -or $TempDownloadDir -eq '') {
-  $TempDownloadDir = Join-Path $RepoRoot 'data/_downloads'
-}
-$dlRoot = New-Item -ItemType Directory -Force -Path $TempDownloadDir
+  # Downloader mode resolution
+  if ($Downloader -eq 'Auto') {
+    if (Get-Command aria2c -ErrorAction SilentlyContinue) { $script:DownloaderMode = 'Aria2c' } else { $script:DownloaderMode = 'Builtin' }
+  } elseif ($Downloader -eq 'Aria2c') {
+    $script:DownloaderMode = 'Aria2c'
+  } else { $script:DownloaderMode = 'Builtin' }
 
-try {
-  $audioExt = @('.wav','.flac','.mp3','.ogg','.m4a','.aiff','.aif','.aifc')
-  $archiveExt = @('.zip','.tar.gz','.tgz')
+  # Debug log init AFTER $dlRoot is known
+  $debugLog = Join-Path $dlRoot.FullName '_download_debug.log'
+  "# Download debug (`$(Get-Date -Format o)`)" | Out-File -FilePath $debugLog -Encoding UTF8 -Force
+  function Log([string]$tag,[string]$msg='') { try { Add-Content -Path $debugLog -Value ("{0}`t{1}`t{2}" -f (Get-Date -Format o),$tag,$msg) } catch {} }
+
+  Write-Host "Downloader mode: $script:DownloaderMode"
+
+  # ---------------------------------------------------------------------------
+  # CORE IMPLEMENTATION (existing functions follow)
+  # ---------------------------------------------------------------------------
 
   function Get-UrlVariants([string]$u) {
     $candidates = New-Object System.Collections.Generic.List[string]
@@ -242,6 +175,32 @@ try {
     if ($u -match 'https?://storage\.googleapis\.com/magentadata/datasets/nsynth/(?<fname>nsynth-(train|valid|test)\.jsonwav\.(tgz|tar\.gz))') {
       $fname = $Matches['fname']
       $candidates.Add("https://download.magenta.tensorflow.org/datasets/nsynth/$fname")
+    }
+    # Zenodo record vs records path toggling & ?download=1 normalization
+    if ($u -match '^https?://zenodo\.org/(?<rec>record|records)/(?<id>\d+)/(?:files/)?(?<rest>[^?]+)(?<query>\?download=1)?$') {
+      $id = $Matches['id']; $rest = $Matches['rest']; $query = $Matches['query']
+      $restVariants = New-Object System.Collections.Generic.List[string]
+      $restVariants.Add($rest)
+      # If filename has no extension (e.g. DEMAND_Real_World_Noise_Dataset) assume .zip as a common archive
+      if ($rest -notmatch '\.[A-Za-z0-9]{2,4}$') { $restVariants.Add($rest + '.zip') }
+      $bases = @("https://zenodo.org/record/$id/files/$rest","https://zenodo.org/records/$id/files/$rest")
+      foreach ($rv in $restVariants) {
+        $bases = @("https://zenodo.org/record/$id/files/$rv","https://zenodo.org/records/$id/files/$rv")
+        foreach ($b in $bases) {
+          if (-not ($candidates -contains $b)) { $candidates.Add($b) }
+          $dl = $b + '?download=1'
+          if (-not ($candidates -contains $dl)) { $candidates.Add($dl) }
+        }
+      }
+      # Also allow without /files/ segment (some older Zenodo URLs omit it)
+      foreach ($rv in $restVariants) {
+        $altBases = @("https://zenodo.org/record/$id/$rv","https://zenodo.org/records/$id/$rv")
+        foreach ($b in $altBases) {
+          if (-not ($candidates -contains $b)) { $candidates.Add($b) }
+          $dl = $b + '?download=1'
+          if (-not ($candidates -contains $dl)) { $candidates.Add($dl) }
+        }
+      }
     }
     # Deduplicate while preserving order
     return [string[]]([System.Linq.Enumerable]::ToArray([System.Linq.Enumerable]::Distinct($candidates)))
@@ -307,13 +266,12 @@ try {
   }
 
   function Download-And-Collect([string[]]$urls, [string]$subset) {
-    $outputs = @()
-    $okCount = 0
+    $outputs   = @()
+    $okCount   = 0
     $failCount = 0
     $subsetDir = Join-Path $dlRoot.FullName $subset
     New-Item -ItemType Directory -Force -Path $subsetDir | Out-Null
-    $i = 0
-    $badArchiveLog = Join-Path $subsetDir "_invalid_archives.txt"
+    $badArchiveLog = Join-Path $subsetDir '_invalid_archives.txt'
     if (Test-Path $badArchiveLog) { Remove-Item $badArchiveLog -Force -ErrorAction SilentlyContinue }
 
     function Test-GzipHeader([string]$file) {
@@ -328,99 +286,119 @@ try {
       } catch { return $false }
     }
 
-    function Test-TarList([string]$file) {
-      if (-not (Get-Command tar -ErrorAction SilentlyContinue)) { return $true } # can't test, assume ok
+    function Test-TarList([string]$file, [switch]$lenient) {
+      if (-not (Get-Command tar -ErrorAction SilentlyContinue)) { return $true }
       try {
-        $p = & tar -tzf $file 2>$null | Select-Object -First 1
-        if ($LASTEXITCODE -ne 0) { return $false }
-        return $true
+        $outLines = & tar -tzf $file 2>&1
+        $exitCode = $LASTEXITCODE
+        $hasEntry = $false
+        foreach ($l in $outLines) {
+          if ($l -match '^(tar:|bsdtar:)') { continue }
+          if ($l -match '/') { $hasEntry = $true; break }
+          if ($l -match '\\.') { $hasEntry = $true; break }
+          if ($l -match '[A-Za-z0-9]') { $hasEntry = $true; break }
+        }
+        if ($exitCode -eq 0) { return $true }
+        if ($lenient -and $hasEntry) { return $true }
+        return $false
       } catch { return $false }
     }
+
+    $i = 0
     foreach ($u in $urls) {
       $i++
       if (-not $u -or $u.Trim() -eq '') { continue }
       $fname = Get-SafeFileName $u $i
-      $dest = Join-Path $subsetDir $fname
+      $dest  = Join-Path $subsetDir $fname
       Write-Host "Downloading [$subset] $u"
       $variants = Get-UrlVariants $u
       $ok = $false
       foreach ($cand in $variants) {
         if ($cand -ne $u) { Write-Warning "Trying alternate: $cand" }
+        Log 'VARIANT' "$subset`t$cand"
         $dest = Join-Path $subsetDir (Get-SafeFileName $cand $i)
         if (Test-Path $dest -PathType Leaf) {
+          $reuseOk = $true
           try { $sz = (Get-Item $dest).Length } catch { $sz = 0 }
           if ($sz -gt 0) {
-            # If it's an archive, validate before reuse
-            $reuseOk = $true
             $dl = $dest.ToLower()
             if ($dl.EndsWith('.tar.gz') -or $dl.EndsWith('.tgz')) {
-              if (-not (Test-GzipHeader $dest) -or -not (Test-TarList $dest)) {
-                Write-Warning "Corrupt cached archive detected; deleting and redownloading: $dest"
+              $gzipOk = Test-GzipHeader $dest
+              $tarOk  = Test-TarList $dest -lenient:$LenientArchiveValidation
+              if ($gzipOk -and -not $tarOk -and $TrustGzipIfLarge) {
+                try { $sizeMB = [math]::Round(((Get-Item $dest).Length/1MB),2) } catch { $sizeMB = 0 }
+                if ($sizeMB -ge $LargeArchiveTrustMB) {
+                  Write-Host "Trusting large gzip archive without successful tar listing (cached, size=${sizeMB}MB >= $LargeArchiveTrustMB MB): $dest"
+                  Log 'TRUST_LARGE_GZIP_CACHE' "$dest`t${sizeMB}MB"
+                  $tarOk = $true
+                }
+              }
+              if (-not $gzipOk -or -not $tarOk) {
+                $reason = @(); if (-not $gzipOk) { $reason += 'gzip-header' }; if (-not $tarOk) { $reason += 'tar-listing' }
+                Write-Warning "Cached archive failed validation ($($reason -join '+')) -> deleting and redownloading: $dest"
                 try { Remove-Item $dest -Force -ErrorAction SilentlyContinue } catch {}
+                Log 'CACHE_INVALIDATE' "$dest`t$($reason -join '+')"
                 $reuseOk = $false
               }
             }
-            if ($reuseOk) { Write-Host "Reusing existing: $dest"; $ok = $true; break }
+            if ($reuseOk) { Write-Host "Reusing existing: $dest"; Log 'REUSE_OK' "$dest"; $ok = $true; break }
           }
         }
         if (Invoke-Download $cand $dest) {
-          $dl = $dest.ToLower()
-          $archiveOk = $true
+          $dl = $dest.ToLower(); $archiveOk = $true
           if ($dl.EndsWith('.tar.gz') -or $dl.EndsWith('.tgz')) {
-            if (-not (Test-GzipHeader $dest) -or -not (Test-TarList $dest)) {
-              Write-Warning "Downloaded archive failed validation: $dest"
-              Add-Content -Path $badArchiveLog -Value $dest
+            $gzipOk = Test-GzipHeader $dest
+            $tarOk  = Test-TarList $dest -lenient:$LenientArchiveValidation
+            if ($gzipOk -and -not $tarOk -and $TrustGzipIfLarge) {
+              try { $sizeMB = [math]::Round(((Get-Item $dest).Length/1MB),2) } catch { $sizeMB = 0 }
+              if ($sizeMB -ge $LargeArchiveTrustMB) {
+                Write-Host "Trusting large gzip archive without successful tar listing (fresh, size=${sizeMB}MB >= $LargeArchiveTrustMB MB): $dest"
+                Log 'TRUST_LARGE_GZIP_FRESH' "$dest`t${sizeMB}MB"
+                $tarOk = $true
+              }
+            }
+            if (-not $gzipOk -or -not $tarOk) {
+              $reason = @(); if (-not $gzipOk) { $reason += 'gzip-header' }; if (-not $tarOk) { $reason += 'tar-listing' }
+              Write-Warning "Downloaded archive failed validation ($($reason -join '+')): $dest"
+              Add-Content -Path $badArchiveLog -Value "$dest`t$($reason -join '+')"
+              Log 'DOWNLOAD_INVALID' "$dest`t$($reason -join '+')"
               try { Remove-Item $dest -Force -ErrorAction SilentlyContinue } catch {}
               $archiveOk = $false
             }
           }
-          if ($archiveOk) { $ok = $true; break }
-        }
+          if ($archiveOk) { Log 'DOWNLOAD_OK' "$dest"; $ok = $true; break }
+        } else { Log 'DOWNLOAD_FAIL' "$cand" }
       }
       if (-not $ok) { $failCount++; continue }
       $l = $dest.ToLower()
       if ($audioExt | Where-Object { $l.EndsWith($_) }) {
-        if ($IgnoreAppleResourceForks -and ([IO.Path]::GetFileName($dest)).StartsWith('._')) {
-          # silently ignore resource fork file
-        } else {
-          $outputs += $dest; $okCount++
-        }
+        if ($IgnoreAppleResourceForks -and ([IO.Path]::GetFileName($dest)).StartsWith('._')) { } else { $outputs += $dest; $okCount++ }
       } elseif ($l.EndsWith('.zip')) {
-        $zipHash = [Math]::Abs(($dest).GetHashCode())
-        $zipOut = Join-Path $subsetDir ("unzip_" + $zipHash)
+        $zipHash = [Math]::Abs(($dest).GetHashCode()); $zipOut = Join-Path $subsetDir ("unzip_" + $zipHash)
         New-Item -ItemType Directory -Force -Path $zipOut | Out-Null
         $found = @()
         if (Test-Path $zipOut) {
           $found = (Get-ChildItem $zipOut -Recurse -ErrorAction SilentlyContinue | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
         }
         if (-not $found -or $found.Count -eq 0) {
-          Expand-Archive -Path $dest -DestinationPath $zipOut -Force
-          $found = (Get-ChildItem $zipOut -Recurse | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
+          try { Expand-Archive -Path $dest -DestinationPath $zipOut -Force } catch { Write-Warning "Expand-Archive failed: $dest ($($_.Exception.Message))"; Log 'ZIP_EXPAND_FAIL' "$dest`t$($_.Exception.Message)" }
+          $found = (Get-ChildItem $zipOut -Recurse -ErrorAction SilentlyContinue | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
         }
-        if ($found) {
-          if ($IgnoreAppleResourceForks) { $found = $found | Where-Object { -not ([IO.Path]::GetFileName($_).StartsWith('._')) } }
-          if ($found -and $found.Count -gt 0) { $outputs += $found; $okCount++ } else { $failCount++ }
-        } else { $failCount++ }
+        if ($found) { if ($IgnoreAppleResourceForks) { $found = $found | Where-Object { -not ([IO.Path]::GetFileName($_).StartsWith('._')) } }; if ($found -and $found.Count -gt 0) { $outputs += $found; $okCount++ } else { $failCount++ } } else { $failCount++ }
       } elseif ($l.EndsWith('.tar.gz') -or $l.EndsWith('.tgz')) {
         if (Get-Command tar -ErrorAction SilentlyContinue) {
-          $tarHash = [Math]::Abs(($dest).GetHashCode())
-          $tarOut = Join-Path $subsetDir ("untar_" + $tarHash)
+          $tarHash = [Math]::Abs(($dest).GetHashCode()); $tarOut = Join-Path $subsetDir ("untar_" + $tarHash)
           New-Item -ItemType Directory -Force -Path $tarOut | Out-Null
-          $found = @()
-          if (Test-Path $tarOut) {
-            $found = (Get-ChildItem $tarOut -Recurse -ErrorAction SilentlyContinue | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
-          }
-          if (-not $found -or $found.Count -eq 0) {
-            tar -xzf $dest -C $tarOut
-            $found = (Get-ChildItem $tarOut -Recurse | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
-          }
-          if ($found) {
-            if ($IgnoreAppleResourceForks) { $found = $found | Where-Object { -not ([IO.Path]::GetFileName($_).StartsWith('._')) } }
-            if ($found -and $found.Count -gt 0) { $outputs += $found; $okCount++ } else { $failCount++ }
-          } else { $failCount++ }
-        } else {
-          Write-Warning "tar not available; skipping archive $dest"; $failCount++
-        }
+            $found = @()
+            if (Test-Path $tarOut) {
+              $found = (Get-ChildItem $tarOut -Recurse -ErrorAction SilentlyContinue | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
+            }
+            if (-not $found -or $found.Count -eq 0) {
+              try { tar -xzf $dest -C $tarOut } catch { Write-Warning "tar extract failed: $dest ($($_.Exception.Message))"; Log 'TAR_EXTRACT_FAIL' "$dest`t$($_.Exception.Message)" }
+              $found = (Get-ChildItem $tarOut -Recurse -ErrorAction SilentlyContinue | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
+            }
+            if ($found) { if ($IgnoreAppleResourceForks) { $found = $found | Where-Object { -not ([IO.Path]::GetFileName($_).StartsWith('._')) } }; if ($found -and $found.Count -gt 0) { $outputs += $found; $okCount++ } else { $failCount++ } } else { $failCount++ }
+        } else { Write-Warning "tar not available; skipping archive $dest"; $failCount++ }
       } elseif ($l.EndsWith('.csv')) {
         Write-Host "Metadata CSV detected (not audio): $dest"
       } else {
@@ -428,7 +406,8 @@ try {
       }
     }
     Write-Host "[$subset] successful items: $okCount, failed/empty: $failCount"
-    return $outputs
+    # Ensure an array is always returned (even for 0 or 1 element) to make .Count safe
+    return ,$outputs
   }
 
   $gUrls = if ($GuitarUrls) { Read-Urls $GuitarUrls } else { @() }
@@ -454,8 +433,8 @@ try {
     return
   }
 
-  $gFiles = if ($gUrls) { Download-And-Collect $gUrls 'guitar' } else { @() }
-  $nFiles = if ($nUrls) { Download-And-Collect $nUrls 'noise' } else { @() }
+  $gFiles = if ($gUrls) { @(Download-And-Collect $gUrls 'guitar') } else { @() }
+  $nFiles = if ($nUrls) { @(Download-And-Collect $nUrls 'noise') } else { @() }
 
   # If Medley-solos-DB metadata CSV is present, filter guitar files by allowed instruments
   if ($PreferMedleyCsv -and $gFiles -and $gFiles.Count -gt 0) {
@@ -522,8 +501,8 @@ try {
   if (Test-Path $skipDurationLog) { Remove-Item $skipDurationLog -Force -ErrorAction SilentlyContinue }
   if (Test-Path $skipNoAudioLog) { Remove-Item $skipNoAudioLog -Force -ErrorAction SilentlyContinue }
     if ($ValidateBeforeConvert -and -not $canProbe) { Write-Host "Validation requested but ffprobe not found; proceeding without pre-validation." }
-    $convertedCounter = [System.Threading.Interlocked]::Increment
-    $converted = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+  # Concurrent bag only used for potential future metadata capture; keep placeholder
+  $converted = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
     if ($UseParallel -and $PSVersionTable.PSVersion.Major -ge 7) {
       $throttle = if ($ParallelJobs -gt 0) { $ParallelJobs } else { 4 }
       $files | ForEach-Object -Parallel {
@@ -595,17 +574,18 @@ try {
     }
     $convertedCount = 0
     if (Test-Path (Join-Path $outDir '_converted_files.txt')) {
-      $convertedCount = (Get-Content (Join-Path $outDir '_converted_files.txt')).Count
+      $convertedLines = @(Get-Content (Join-Path $outDir '_converted_files.txt'))
+      $convertedCount = $convertedLines.Count
     }
     $noAudioCount = 0
-    if (Test-Path $skipNoAudioLog) { $noAudioCount = (Get-Content $skipNoAudioLog | Sort-Object -Unique).Count }
+  if (Test-Path $skipNoAudioLog) { $noAudioCount = @(Get-Content $skipNoAudioLog | Sort-Object -Unique).Count }
   $invalidCount = 0
   $durationSkipCount = 0
     $invalidList = @()
     if ($ValidateBeforeConvert -and $canProbe) {
       if (Test-Path $skipLog) { $invalidList = Get-Content $skipLog | Sort-Object -Unique; $invalidCount = $invalidList.Count }
     }
-    if (Test-Path $skipDurationLog) { $durationSkipCount = (Get-Content $skipDurationLog | Sort-Object -Unique).Count }
+  if (Test-Path $skipDurationLog) { $durationSkipCount = @(Get-Content $skipDurationLog | Sort-Object -Unique).Count }
     if ($ValidateBeforeConvert -and $canProbe) {
       Write-Host "Validation summary: converted=$convertedCount, skipped_invalid=$invalidCount, skipped_no_audio=$noAudioCount"
       if ($invalidCount -gt 0) { Write-Host "First invalid (up to 5):"; $invalidList | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" } }
@@ -626,8 +606,10 @@ try {
     }
   }
 
-  if ($gFiles -and $gFiles.Count -gt 0) { Write-Host "Converting guitar files -> $GuitarOut (Parallel=$UseParallel, Jobs=$ParallelJobs, Threads/job=$FfmpegThreadsPerJob)"; Convert-To-48kMono $gFiles $GuitarOut } else { Write-Host "No guitar files downloaded." }
-  if ($nFiles -and $nFiles.Count -gt 0) { Write-Host "Converting noise files -> $NoiseOut (Parallel=$UseParallel, Jobs=$ParallelJobs, Threads/job=$FfmpegThreadsPerJob)"; Convert-To-48kMono $nFiles $NoiseOut } else { Write-Host "No noise files downloaded." }
+  $gCount = if ($null -ne $gFiles -and ($gFiles -is [System.Collections.ICollection])) { $gFiles.Count } elseif ($gFiles) { ($gFiles | Measure-Object).Count } else { 0 }
+  $nCount = if ($null -ne $nFiles -and ($nFiles -is [System.Collections.ICollection])) { $nFiles.Count } elseif ($nFiles) { ($nFiles | Measure-Object).Count } else { 0 }
+  if ($gCount -gt 0) { Write-Host "Converting guitar files -> $GuitarOut (Parallel=$UseParallel, Jobs=$ParallelJobs, Threads/job=$FfmpegThreadsPerJob)"; Convert-To-48kMono $gFiles $GuitarOut } else { Write-Host "No guitar files downloaded." }
+  if ($nCount -gt 0) { Write-Host "Converting noise files -> $NoiseOut (Parallel=$UseParallel, Jobs=$ParallelJobs, Threads/job=$FfmpegThreadsPerJob)"; Convert-To-48kMono $nFiles $NoiseOut } else { Write-Host "No noise files downloaded." }
 
   if ($WriteDatasetSummary) {
     function Write-Summary([string]$dir,[string]$label) {
@@ -665,7 +647,15 @@ try {
         median_seconds = [math]::Round($median,3)
         min_seconds = [math]::Round($min,3)
         max_seconds = [math]::Round($max,3)
-        sample_rates = $srSet.ToArray()
+        sample_rates = $(
+          try {
+            if ($srSet -and ($srSet -is [System.Collections.IEnumerable]) -and ($srSet.GetType().Name -ne 'Int32')) {
+              @($srSet.ToArray())
+            } elseif ($srSet -is [int]) {
+              @($srSet)
+            } else { @() }
+          } catch { @() }
+        )
         generated_utc = (Get-Date).ToUniversalTime().ToString('o')
       }
       $jsonPath = Join-Path $dir 'dataset_summary.json'

@@ -148,21 +148,22 @@ if ($FetchFromUrls) {
   if (-not (Test-Path $fetchPs1)) { throw "fetch_real_data.ps1 not found at $fetchPs1" }
   New-Item -ItemType Directory -Force -Path $GuitarIn | Out-Null
   New-Item -ItemType Directory -Force -Path $NoiseIn  | Out-Null
-  $fetchArgs = @(
-    '-GuitarUrls', $GuitarUrls,
-    '-NoiseUrls', $NoiseUrls,
-    '-GuitarOut', $GuitarIn,
-    '-NoiseOut', $NoiseIn,
-    '-AllowInsecure:$' + $AllowInsecure,
-    '-Downloader', $Downloader,
-    '-MinSeconds', $MinSeconds,
-    '-MaxSeconds', $MaxSeconds,
-    '-IgnoreAppleResourceForks:$' + $IgnoreAppleResourceForks,
-    '-PerFileSkipWarnings:$' + $PerFileSkipWarnings
-  )
-  if ($ShowDownloadProgress) { $fetchArgs += '-ShowDownloadProgress' }
-  if ($WriteDatasetSummary) { $fetchArgs += '-WriteDatasetSummary' }
-  & $fetchPs1 @fetchArgs
+  $fetchParams = @{
+    GuitarUrls = $GuitarUrls
+    NoiseUrls  = $NoiseUrls
+    GuitarOut  = $GuitarIn
+    NoiseOut   = $NoiseIn
+    Downloader = $Downloader
+    MinSeconds = $MinSeconds
+    MaxSeconds = $MaxSeconds
+  }
+  if ($AllowInsecure) { $fetchParams['AllowInsecure'] = $true }
+  if ($IgnoreAppleResourceForks) { $fetchParams['IgnoreAppleResourceForks'] = $true }
+  if ($PerFileSkipWarnings) { $fetchParams['PerFileSkipWarnings'] = $true }
+  if ($ShowDownloadProgress) { $fetchParams['ShowDownloadProgress'] = $true }
+  if ($WriteDatasetSummary) { $fetchParams['WriteDatasetSummary'] = $true }
+  Write-Host ("fetch_real_data.ps1 param summary: " + ($fetchParams.GetEnumerator() | ForEach-Object { "{0}={1}" -f $_.Key, $_.Value } | Sort-Object | Out-String).Trim())
+  & $fetchPs1 @fetchParams
 }
 
 # Set-PSDebug -Off

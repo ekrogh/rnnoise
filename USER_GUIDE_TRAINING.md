@@ -18,6 +18,12 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\pipeline_guitar.ps1 \
 ```
 (Identical to the updated `scripts/fetch_And_Train_In_One_Go.ps1`).
 
+## Resulting files
+ - features: D:\Users\eigil\projects\machineLearning\rnnoise\features.f32
+ - checkpoints: D:\Users\eigil\projects\machineLearning\rnnoise\models\checkpoints
+ - C weights: D:\Users\eigil\projects\machineLearning\rnnoise\models\c\rnnoise_data.[ch] copied into src/
+ - built binaries in: D:\Users\eigil\projects\machineLearning\rnnoise\build\Release (includes rnnoise_demo.exe)
+
 ## When To Use Each Data Mode
 - **Auto (default)**: Uses previously fetched WAVs in `data/guitar_clean` & `data/interfere` if present; otherwise synthesizes a small starter set.
 - **Synthetic**: Always re-synthesizes small artificial datasets (useful for quick debugging or environment tests).
