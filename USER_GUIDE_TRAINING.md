@@ -7,16 +7,18 @@ Typical one-shot end‑to‑end run (download real data if needed, apply duratio
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\pipeline_guitar.ps1 \ 
-  -FetchFromUrls \ 
-  -Downloader Auto \ 
-  -GuitarUrls .\scripts\urls_guitar.txt \ 
-  -NoiseUrls .\scripts\urls_noise.txt \ 
-  -DataMode Auto \ 
-  -MinSeconds 1 -MaxSeconds 10 \ 
-  -WriteDatasetSummary \ 
-  -FeatureCount 200 -Epochs 1 -BatchSize 64
+  -FetchFromUrls # Fetch real-data.
 ```
-(Identical to the updated `scripts/fetch_And_Train_In_One_Go.ps1`).
+The rest arguments are default
+(See also `scripts/fetch_And_Train_In_One_Go.ps1`).
+
+
+or
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\pipeline_guitar.ps1
+```
+All defaults. Uses cached data.
 
 ## Resulting files
  - features: D:\Users\eigil\projects\machineLearning\rnnoise\features.f32

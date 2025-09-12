@@ -31,8 +31,8 @@ Notes
 
 param(
   [string]$VenvPath = "D:\venvs\rnnoise312",
-  [int]$FeatureCount = 100,
-  [int]$Epochs = 5,
+  [int]$FeatureCount = 5000,
+  [int]$Epochs = 100,
   [int]$BatchSize = 64,
   [string]$BuildType = "Release",
   [switch]$SkipSynth = $false,
