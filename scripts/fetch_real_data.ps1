@@ -71,7 +71,11 @@ try {
   # ---------------------------------------------------------------------------
   # Initial setup
   # ---------------------------------------------------------------------------
-  if (-not $TempDownloadDir) { $TempDownloadDir = Join-Path (Resolve-Path .).Path 'data/_downloads' }
+  # Default download/cache directory moved to per-user AppData to avoid polluting repo and survive clean/re-clones
+  if (-not $TempDownloadDir) {
+    $userAppData = [Environment]::GetFolderPath('LocalApplicationData')
+    $TempDownloadDir = Join-Path $userAppData 'rnnoise_downloads'
+  }
   if (-not (Test-Path $TempDownloadDir)) { New-Item -ItemType Directory -Path $TempDownloadDir -Force | Out-Null }
   $dlRoot = Get-Item $TempDownloadDir
 
@@ -202,6 +206,51 @@ try {
         }
       }
     }
+
+    # Generic fallback for ANY URL lacking a recognized extension: attempt common archive and metadata variants.
+    try {
+      $uri2 = [Uri]$u
+      $path2 = $uri2.AbsolutePath.TrimEnd('/')
+      $leaf = if ($path2.Contains('/')) { $path2.Substring($path2.LastIndexOf('/')+1) } else { $path2 }
+      if (-not [string]::IsNullOrWhiteSpace($leaf)) {
+        $leafCore = $leaf
+        if ($leafCore -match '^(?<core>[^?]+)') { $leafCore = $Matches['core'] }
+        $lowerLeaf = $leafCore.ToLower()
+        $knownEndings = @('.wav','.flac','.mp3','.ogg','.m4a','.aiff','.aif','.aac','.zip','.tar.gz','.tgz','.csv')
+        $hasKnown = $false
+        foreach ($e in $knownEndings) { if ($lowerLeaf.EndsWith($e)) { $hasKnown = $true; break } }
+        # crude extension detection (dot + 2-5 alnum chars) unless .tar.gz
+        $simpleExt = ($lowerLeaf -match '\.[A-Za-z0-9]{2,5}$') -or $lowerLeaf.EndsWith('.tar.gz')
+        if (-not $hasKnown -and -not $simpleExt) {
+          foreach ($suf in @('.tar.gz','.tgz','.zip')) {
+            $cand = $u + $suf
+            if (-not ($candidates -contains $cand)) { $candidates.Add($cand) }
+            if ($u -notmatch '\?') {
+              $candDl = $cand + '?download=1'
+              if (-not ($candidates -contains $candDl)) { $candidates.Add($candDl) }
+            }
+          }
+          # Medley-specific heuristic: add metadata CSV
+          if ($lowerLeaf -match 'medley-solos-db$') {
+            $meta = $u + '_metadata.csv'
+            if (-not ($candidates -contains $meta)) { $candidates.Add($meta) }
+            if ($u -notmatch '\?') {
+              $metaDl = $meta + '?download=1'
+              if (-not ($candidates -contains $metaDl)) { $candidates.Add($metaDl) }
+            }
+          }
+        }
+        # If looks like metadata base without .csv
+        if ($lowerLeaf -match 'medley-solos-db_metadata$' -and (-not $lowerLeaf.EndsWith('.csv'))) {
+          $csvCand = $u + '.csv'
+          if (-not ($candidates -contains $csvCand)) { $candidates.Add($csvCand) }
+          if ($u -notmatch '\?') {
+            $csvCandDl = $csvCand + '?download=1'
+            if (-not ($candidates -contains $csvCandDl)) { $candidates.Add($csvCandDl) }
+          }
+        }
+      }
+    } catch {}
     # Deduplicate while preserving order
     return [string[]]([System.Linq.Enumerable]::ToArray([System.Linq.Enumerable]::Distinct($candidates)))
   }
