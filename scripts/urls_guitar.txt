@@ -7,8 +7,8 @@
 # https://zenodo.org/records/3464194/files/Medley-solos-DB.tar.gz?download=1
 # Archive: https://zenodo.org/records/3464194/files/Medley-solos-DB.tar.gz?download=1
 # Metadata: https://zenodo.org/records/3464194/files/Medley-solos-DB_metadata.csv?download=1
-Archive: https://zenodo.org/records/3464194/files/Medley-solos-DB
-Metadata: https://zenodo.org/records/3464194/files/Medley-solos-DB_metadata
+Archive: https://zenodo.org/records/3464194/files/Medley-solos-DB.tar.gz
+Metadata: https://zenodo.org/records/3464194/files/Medley-solos-DB_metadata.csv
 
 # Alternate guitar-strong dataset (OpenMIC-2018, contains labeled instrument clips incl. guitar)
 # Large file (2.6 GB). If Zenodo returns 404, open the record in a browser and copy the current file link.

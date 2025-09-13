@@ -6,8 +6,7 @@ This guide explains how to fetch real datasets, prepare features, train a guitar
 Typical one-shot end‑to‑end run (download real data if needed, apply duration filtering, generate dataset summaries, train 1 epoch, export weights):
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\pipeline_guitar.ps1 \ 
-  -FetchFromUrls # Fetch real-data.
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\pipeline_guitar.ps1 -FetchFromUrls
 ```
 The rest arguments are default
 (See also `scripts/fetch_And_Train_In_One_Go.ps1`).
