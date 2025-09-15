@@ -42,6 +42,7 @@ parser.add_argument('output', type=str, help='path to output folder')
 
 parser.add_argument('--suffix', type=str, help="model name suffix", default="")
 parser.add_argument('--cuda-visible-devices', type=str, help="comma separates list of cuda visible device indices, default: CUDA_VISIBLE_DEVICES", default=None)
+parser.add_argument('--workers', type=int, help='DataLoader worker processes (Windows default override to 0 if >0)', default=4)
 
 
 model_group = parser.add_argument_group(title="model parameters")
@@ -113,7 +114,21 @@ if type(args.initial_checkpoint) != type(None):
 checkpoint['state_dict']    = model.state_dict()
 
 dataset = RNNoiseDataset(args.features)
-dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=4)
+workers = args.workers
+import platform
+if platform.system().lower().startswith('win') and workers > 0:
+    # Windows spawn + memmap + large objects can cause pickling errors; fall back to single-process loading.
+    workers = 0
+    print("[train_rnnoise] Forcing workers=0 on Windows to avoid multiprocessing pickle issues.")
+
+dataloader = torch.utils.data.DataLoader(
+    dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    drop_last=True,
+    num_workers=workers,
+    pin_memory=(torch.cuda.is_available() and workers > 0)
+)
 
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=adam_betas, eps=adam_eps)
