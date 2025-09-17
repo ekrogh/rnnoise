@@ -13,7 +13,7 @@
 
 #define CONV1_DELAY 1
 
-#define CONV2_OUT_SIZE 384
+#define CONV2_OUT_SIZE 256
 
 #define CONV2_IN_SIZE 128
 
@@ -21,17 +21,17 @@
 
 #define CONV2_DELAY 1
 
-#define GRU1_OUT_SIZE 384
+#define GRU1_OUT_SIZE 256
 
-#define GRU1_STATE_SIZE 384
+#define GRU1_STATE_SIZE 256
 
-#define GRU2_OUT_SIZE 384
+#define GRU2_OUT_SIZE 256
 
-#define GRU2_STATE_SIZE 384
+#define GRU2_STATE_SIZE 256
 
-#define GRU3_OUT_SIZE 384
+#define GRU3_OUT_SIZE 256
 
-#define GRU3_STATE_SIZE 384
+#define GRU3_STATE_SIZE 256
 
 #define DENSE_OUT_OUT_SIZE 32
 

@@ -34,6 +34,11 @@ param(
   [int]$FeatureCount = 5000,
   [int]$Epochs = 100,
   [int]$BatchSize = 64,
+  [int]$SequenceLength = 2000,
+  [int]$Workers = 0,
+  [string]$CudaVisibleDevices = '',
+  [int]$CondSize = 128,
+  [int]$GruSize = 256,
   [string]$BuildType = "Release",
   [switch]$SkipSynth = $false,
   [switch]$CPUOnly = $true,
@@ -44,6 +49,13 @@ param(
   [string]$GuitarUrls = (Join-Path $PSScriptRoot 'urls_guitar.txt'),
   [string]$NoiseUrls = (Join-Path $PSScriptRoot 'urls_noise.txt'),
   [switch]$AllowInsecure = $false,
+  # Medley-solos-DB filtering passthrough
+  [switch]$PreferMedleyCsv = $true,
+  [string[]]$InstrumentAllowList = @('guitar','electric_guitar','acoustic_guitar'),
+  [switch]$UseParallel = $true,
+  [int]$ParallelJobs = 0,
+  [int]$FfmpegThreadsPerJob = 1,
+  [switch]$ValidateBeforeConvert = $false,
   # Pass-through download/convert tuning for fetch_real_data.ps1
   [ValidateSet('Auto','Builtin','Aria2c')][string]$Downloader = 'Auto',
   [switch]$ShowDownloadProgress = $false,
@@ -71,6 +83,7 @@ Write-Host "  Real data:         pipeline_guitar.ps1 -DataMode Real -GuitarDir D
 Write-Host "Notes:"
 Write-Host "  - Requires ffmpeg and CMake in PATH."
 Write-Host "  - Defaults to CPU-only Torch; pass -CPUOnly:`$false to try CUDA."
+Write-Host "  - GPU tuning: use -BatchSize, -SequenceLength, -GruSize, and -CondSize to fit VRAM."
 Write-Host "  - DataMode: Auto|Synthetic|Real (see header)."
 Write-Host "  - Optional fetch: -FetchFromUrls to download from URL lists before training."
 Write-Host "Artifacts:"
@@ -98,9 +111,23 @@ Write-Host "Using Python: $Py"
 try { & $Py -m pip config set global.cache-dir "D:/pip-cache" | Out-Null } catch {}
 & $Py -m pip install numpy soundfile tqdm
 if ($CPUOnly) {
-  & $Py -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+  & $Py -m pip install --upgrade torch --index-url https://download.pytorch.org/whl/cpu
 } else {
-  & $Py -m pip install torch
+  # If this venv already has CUDA-enabled torch, skip reinstall; otherwise install cu121 wheel.
+  $cudaProbeCode = @'
+import sys
+try:
+    import torch
+    sys.stdout.write("1" if torch.cuda.is_available() else "0")
+except Exception:
+    sys.stdout.write("0")
+'@
+  $cudaProbe = & $Py -c $cudaProbeCode
+  if ($cudaProbe -eq '1') {
+    Write-Host "CUDA-enabled torch already available; skipping reinstall."
+  } else {
+    & $Py -m pip install --upgrade torch --index-url https://download.pytorch.org/whl/cu121
+  }
 }
 
 # Resolve input data strategy
@@ -157,6 +184,13 @@ if ($FetchFromUrls) {
     MinSeconds = $MinSeconds
     MaxSeconds = $MaxSeconds
   }
+  # Prefer Medley CSV instrument filtering and parallel conversion when available
+  if ($PreferMedleyCsv) { $fetchParams['PreferMedleyCsv'] = $true }
+  if ($InstrumentAllowList -and $InstrumentAllowList.Count -gt 0) { $fetchParams['InstrumentAllowList'] = $InstrumentAllowList }
+  if ($UseParallel) { $fetchParams['UseParallel'] = $true }
+  if ($ParallelJobs -gt 0) { $fetchParams['ParallelJobs'] = $ParallelJobs }
+  if ($FfmpegThreadsPerJob -gt 0) { $fetchParams['FfmpegThreadsPerJob'] = $FfmpegThreadsPerJob }
+  if ($ValidateBeforeConvert) { $fetchParams['ValidateBeforeConvert'] = $true }
   if ($AllowInsecure) { $fetchParams['AllowInsecure'] = $true }
   if ($IgnoreAppleResourceForks) { $fetchParams['IgnoreAppleResourceForks'] = $true }
   if ($PerFileSkipWarnings) { $fetchParams['PerFileSkipWarnings'] = $true }
@@ -174,13 +208,22 @@ Push-Location $RepoRoot
 try {
   $speechList = Join-Path $RepoRoot 'list_speech.txt'
   $noiseList  = Join-Path $RepoRoot 'list_noise.txt'
-  Get-ChildItem $GuitarIn -Recurse -Filter *.wav | ForEach-Object { "file '$( $_.FullName )'" } | Set-Content -Encoding ASCII $speechList
-  Get-ChildItem $NoiseIn  -Recurse -Filter *.wav | ForEach-Object { "file '$( $_.FullName )'" } | Set-Content -Encoding ASCII $noiseList
+  function Format-ConcatLine([string]$p) {
+    # Escape single quotes for ffmpeg concat demuxer
+    $q = $p -replace "'", "\\'"
+    return "file '$q'"
+  }
+  Get-ChildItem $GuitarIn -Recurse -Filter *.wav |
+    ForEach-Object { Format-ConcatLine $_.FullName } |
+    Set-Content -Encoding UTF8 $speechList
+  Get-ChildItem $NoiseIn  -Recurse -Filter *.wav |
+    ForEach-Object { Format-ConcatLine $_.FullName } |
+    Set-Content -Encoding UTF8 $noiseList
 
   if (-not (Test-Path $speechList) -or -not (Get-Content $speechList)) { throw "No WAVs in $GuitarIn." }
   if (-not (Test-Path $noiseList)  -or -not (Get-Content $noiseList))  { throw "No WAVs in $NoiseIn." }
 
-  $ffCommon = @('-hide_banner','-loglevel','error')
+  $ffCommon = @('-hide_banner','-loglevel','error','-nostdin')
   $ffThreads = @(); if ($Threads -ge 0) { $ffThreads = @('-threads', "$Threads") }
   Write-Host "Building speech.pcm ..."
   $speechArgs = @('-y','-f','concat','-safe','0','-i', $speechList) + $ffCommon
@@ -247,7 +290,17 @@ finally { Pop-Location }
 # 7) Train model (PyTorch)
 $ModelsDir = Join-Path $RepoRoot 'models'
 Write-Host "Training PyTorch model for $Epochs epochs..."
-& $Py (Join-Path $RepoRoot 'torch/rnnoise/train_rnnoise.py') (Join-Path $RepoRoot 'features.f32') $ModelsDir --epochs $Epochs --batch-size $BatchSize
+$trainArgs = @()
+$trainArgs += @((Join-Path $RepoRoot 'torch/rnnoise/train_rnnoise.py'))
+$trainArgs += @((Join-Path $RepoRoot 'features.f32'))
+$trainArgs += @($ModelsDir)
+$trainArgs += @('--epochs', "$Epochs", '--batch-size', "$BatchSize")
+if ($SequenceLength -gt 0) { $trainArgs += @('--sequence-length', "$SequenceLength") }
+if ($Workers -ge 0) { $trainArgs += @('--workers', "$Workers") }
+if ($CondSize -gt 0) { $trainArgs += @('--cond-size', "$CondSize") }
+if ($GruSize -gt 0) { $trainArgs += @('--gru-size', "$GruSize") }
+if ($CudaVisibleDevices -ne '') { $trainArgs += @('--cuda-visible-devices', $CudaVisibleDevices) }
+& $Py @trainArgs
 
 # 8) Export weights to C and rebuild rnnoise
 $Checkpoint = Join-Path $ModelsDir (Join-Path 'checkpoints' ("rnnoise_{0}.pth" -f $Epochs))
