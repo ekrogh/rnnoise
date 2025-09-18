@@ -65,6 +65,8 @@ param(
   [switch]$WriteDatasetSummary = $false,
   [switch]$IgnoreAppleResourceForks = $true,
   [switch]$PerFileSkipWarnings = $false,
+  # Download/extract cache root (passed to fetch_real_data.ps1). If empty, the fetch script uses %LOCALAPPDATA%\rnnoise_downloads
+  [string]$TempDownloadDir = '',
   [int]$Threads = 0,
   [int]$MaxConcatSecondsSpeech = 0,
   [int]$MaxConcatSecondsNoise = 0,
@@ -185,6 +187,7 @@ if ($FetchFromUrls) {
     MinSeconds = $MinSeconds
     MaxSeconds = $MaxSeconds
   }
+  if ($TempDownloadDir -and $TempDownloadDir.Trim() -ne '') { $fetchParams['TempDownloadDir'] = $TempDownloadDir }
   if ($MusanMode) { $fetchParams['MusanMode'] = $MusanMode }
   # Prefer Medley CSV instrument filtering and parallel conversion when available
   if ($PreferMedleyCsv) { $fetchParams['PreferMedleyCsv'] = $true }

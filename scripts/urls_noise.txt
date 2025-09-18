@@ -17,5 +17,5 @@ https://zenodo.org/records/1227121/files/DEMAND_Real_World_Noise_Dataset.zip
 # Optional alternates (commented out by default):
 # FSD50K (CC BY 4.0) – large general-purpose sound events; contains many ambient/noise classes
 # Uncomment one or both lines to include
-# https://zenodo.org/records/4060432/files/FSD50K.dev_audio.zip?download=1
-# https://zenodo.org/records/4060432/files/FSD50K.eval_audio.zip?download=1
+https://zenodo.org/records/4060432/files/FSD50K.dev_audio.zip?download=1
+https://zenodo.org/records/4060432/files/FSD50K.eval_audio.zip?download=1
