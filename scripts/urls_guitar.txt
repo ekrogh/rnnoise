@@ -2,6 +2,7 @@
 # Tip: Large downloads. You can comment lines you don't want.
 
 # Medley-solos-DB (Zenodo) – CC BY 4.0 – solo instrument dataset incl. electric guitar
+# IMPORTANT: Include BOTH an Archive line AND a Metadata line below so the pipeline can filter to guitar-only using the CSV.
 # Note: the exact file name on Zenodo can change per version; if 404, open the record in a browser and copy the current file link.
 # https://zenodo.org/records/3464194
 # https://zenodo.org/records/3464194/files/Medley-solos-DB.tar.gz?download=1
@@ -16,7 +17,7 @@ Metadata: https://zenodo.org/records/3464194/files/Medley-solos-DB_metadata.csv
 
 # NSynth (Google Magenta) – CC BY 4.0 – guitar notes (use jsonwav subsets)
 # NSynth json/wav subsets (official links use HTTP and .tar.gz)
-# Archive: http://download.magenta.tensorflow.org/datasets/nsynth/nsynth-valid.jsonwav.tar.gz
-# Archive: http://download.magenta.tensorflow.org/datasets/nsynth/nsynth-test.jsonwav.tar.gz
+Archive: http://download.magenta.tensorflow.org/datasets/nsynth/nsynth-valid.jsonwav.tar.gz
+Archive: http://download.magenta.tensorflow.org/datasets/nsynth/nsynth-test.jsonwav.tar.gz
 
 

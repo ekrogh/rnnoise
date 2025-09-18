@@ -9,6 +9,11 @@ Notes
 - Provide plain text files where each non-empty, non-comment line is a URL to an audio file or zip archive.
 - Supported inputs: wav, flac, mp3, ogg, m4a, aiff/aif, zip (contains audio). Tries tar for .tar.gz/.tgz if available.
 - Requires: ffmpeg; optional: tar (for .tar.gz).
+- Caching: Archives are cached under %LOCALAPPDATA%\rnnoise_downloads and extracted into deterministic
+  folders (untar_<archiveBase>, unzip_<archiveBase>) so repeated runs reuse the same directories.
+  If you previously ran older versions that created hash-named folders, you can safely clean them with:
+    Get-ChildItem "$env:LOCALAPPDATA\rnnoise_downloads" -Recurse -Directory -Filter 'untar_*' | Where-Object { $_.Name -match '^untar_\d+$' } | Remove-Item -Recurse -Force
+    Get-ChildItem "$env:LOCALAPPDATA\rnnoise_downloads" -Recurse -Directory -Filter 'unzip_*' | Where-Object { $_.Name -match '^unzip_\d+$' } | Remove-Item -Recurse -Force
 - Auto Medley mode: if BOTH of these appear in your guitar URL list during one run:
     • Medley-solos-DB.tar.gz (or .tgz)
     • Medley-solos-DB_metadata.csv
@@ -28,6 +33,9 @@ Key Parameters
   -PerFileSkipWarnings                Re-enable per-file skip warnings (normally aggregated into logs).
   -AllowInsecure                      Disable SSL validation (only for trusted internal sources).
 
+MUSAN Control
+  -MusanMode All|NoiseOnly            All includes all MUSAN categories (music, speech, noise). NoiseOnly limits to noise/.
+
 Downloader (aria2c) Tuning
   -AriaMaxConnections <int>           Max connections per server (default 16)
   -AriaSplit <int>                    Initial split count (default 16)
@@ -41,6 +49,7 @@ param(
   [string]$NoiseUrls,
   [string]$GuitarOut = (Join-Path (Resolve-Path .).Path 'data/guitar_clean'),
   [string]$NoiseOut  = (Join-Path (Resolve-Path .).Path 'data/interfere'),
+  [ValidateSet('All','NoiseOnly')][string]$MusanMode = 'All',
   [ValidateSet('Auto','Builtin','Aria2c')][string]$Downloader = 'Auto',
   [switch]$ShowDownloadProgress,
   [int]$MinSeconds = 0,
@@ -315,23 +324,79 @@ try {
   }
 
   function Download-And-Collect([string[]]$urls, [string]$subset) {
-    $outputs   = @()
-    $okCount   = 0
-    $failCount = 0
+    $outputs        = @()
+    $okCount        = 0
+    $failCount      = 0
+    $reusedCount    = 0
+    $downloadedCount= 0
     $subsetDir = Join-Path $dlRoot.FullName $subset
     New-Item -ItemType Directory -Force -Path $subsetDir | Out-Null
     $badArchiveLog = Join-Path $subsetDir '_invalid_archives.txt'
     if (Test-Path $badArchiveLog) { Remove-Item $badArchiveLog -Force -ErrorAction SilentlyContinue }
 
+    function Get-BaseNameFromFile([string]$fileName) {
+      $n = $fileName
+      $lower = $n.ToLower()
+      if ($lower.EndsWith('.tar.gz')) { return $n.Substring(0, $n.Length - 7) }
+      if ($lower.EndsWith('.tgz'))    { return $n.Substring(0, $n.Length - 4) }
+      if ($lower.EndsWith('.zip'))    { return $n.Substring(0, $n.Length - 4) }
+      return [IO.Path]::GetFileNameWithoutExtension($n)
+    }
+
+    function Collect-AudioFromExtract([string]$rootDir, [string]$sourceTag) {
+      if (-not (Test-Path $rootDir -PathType Container)) { return @() }
+      $found = (Get-ChildItem $rootDir -Recurse -ErrorAction SilentlyContinue | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
+      if (-not $found -or $found.Count -eq 0) { return @() }
+      # Apply dataset-specific filters
+      $result = $found
+      if ($MusanMode -eq 'NoiseOnly' -and ($sourceTag -match '(?i)musan')) {
+        $result = $result | ForEach-Object {
+          try { $rel = $_.Substring($rootDir.Length).Replace('\\','/').ToLower(); if ($rel -match '/noise/') { $_ } } catch {}
+        }
+      }
+      if ($sourceTag -match '(?i)nsynth') {
+        $result = $result | ForEach-Object {
+          try { $rel = $_.Substring($rootDir.Length).Replace('\\','/').ToLower(); if ($rel -match '/guitar/') { $_ } } catch {}
+        }
+      }
+      if ($IgnoreAppleResourceForks) { $result = $result | Where-Object { -not ([IO.Path]::GetFileName($_).StartsWith('._')) } }
+      return $result
+    }
+
+    function Try-ReuseExtract([string]$url, [int]$index) {
+      # Based on deterministic folder naming: unzip_<base> / untar_<base>
+      $fname   = Get-SafeFileName $url $index
+      $base    = Get-BaseNameFromFile $fname
+      $untar   = Join-Path $subsetDir ("untar_" + ($base -replace '[^A-Za-z0-9_.-]','_'))
+      $unzip   = Join-Path $subsetDir ("unzip_" + ($base -replace '[^A-Za-z0-9_.-]','_'))
+      $agg     = @()
+      foreach ($candRoot in @($untar, $unzip)) {
+        $files = Collect-AudioFromExtract $candRoot $url
+        if ($files -and $files.Count -gt 0) { $agg += $files }
+      }
+      return ,$agg
+    }
+
     function Test-GzipHeader([string]$file) {
-      try {
+      $i = 0
         if (-not (Test-Path $file -PathType Leaf)) { return $false }
         $fs = [IO.File]::OpenRead($file)
         try {
           if ($fs.Length -lt 32) { return $false }
           $b1 = $fs.ReadByte(); $b2 = $fs.ReadByte();
           return ($b1 -eq 0x1f -and $b2 -eq 0x8b)
-        } finally { $fs.Dispose() }
+        $variants = Get-UrlVariants $u
+
+        # Fast path: if a deterministic extracted folder already exists with audio, reuse it and skip downloading
+        $preReuse = Try-ReuseExtract $u $i
+        if ($preReuse -and $preReuse.Count -gt 0) {
+          Write-Host "Reusing extracted content for [$subset]: $u"
+          $outputs += $preReuse
+          $okCount++
+          $reusedCount++
+          Log 'REUSE_EXTRACT_OK' "$subset`t$u`t$count=$($preReuse.Count)"
+          continue
+        }
       } catch { return $false }
     }
 
@@ -390,7 +455,7 @@ try {
                 $reuseOk = $false
               }
             }
-            if ($reuseOk) { Write-Host "Reusing existing: $dest"; Log 'REUSE_OK' "$dest"; $ok = $true; break }
+            if ($reuseOk) { Write-Host "Reusing existing archive: $dest"; Log 'REUSE_OK' "$dest"; $ok = $true; $reusedCount++; break }
           }
         }
         if (Invoke-Download $cand $dest) {
@@ -415,16 +480,33 @@ try {
               $archiveOk = $false
             }
           }
-          if ($archiveOk) { Log 'DOWNLOAD_OK' "$dest"; $ok = $true; break }
+          if ($archiveOk) { Log 'DOWNLOAD_OK' "$dest"; $ok = $true; $downloadedCount++; break }
         } else { Log 'DOWNLOAD_FAIL' "$cand" }
+
+        # If this variant failed to download, but its deterministic extract folder exists, reuse it
+        if (-not $ok) {
+          $reuseAfterFail = Try-ReuseExtract $cand $i
+          if ($reuseAfterFail -and $reuseAfterFail.Count -gt 0) {
+            Write-Host "Reusing extracted content for [$subset] after download failure: $cand"
+            $outputs += $reuseAfterFail
+            $ok = $true
+            $okCount++
+            $reusedCount++
+            Log 'REUSE_EXTRACT_OK_AFTER_FAIL' "$subset`t$cand`t$count=$($reuseAfterFail.Count)"
+            break
+          }
+        }
       }
       if (-not $ok) { $failCount++; continue }
       $l = $dest.ToLower()
       if ($audioExt | Where-Object { $l.EndsWith($_) }) {
         if ($IgnoreAppleResourceForks -and ([IO.Path]::GetFileName($dest)).StartsWith('._')) { } else { $outputs += $dest; $okCount++ }
-      } elseif ($l.EndsWith('.zip')) {
-        $zipHash = [Math]::Abs(($dest).GetHashCode()); $zipOut = Join-Path $subsetDir ("unzip_" + $zipHash)
-        New-Item -ItemType Directory -Force -Path $zipOut | Out-Null
+  } elseif ($l.EndsWith('.zip')) {
+        # Reuse a deterministic unzip folder per archive name to avoid creating new folders on each run
+        $zipBase = [IO.Path]::GetFileNameWithoutExtension($dest)
+        $zipSafe = ($zipBase -replace '[^A-Za-z0-9_.-]','_')
+        $zipOut = Join-Path $subsetDir ("unzip_" + $zipSafe)
+        if (-not (Test-Path $zipOut)) { New-Item -ItemType Directory -Force -Path $zipOut | Out-Null }
         $found = @()
         if (Test-Path $zipOut) {
           $found = (Get-ChildItem $zipOut -Recurse -ErrorAction SilentlyContinue | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
@@ -433,11 +515,37 @@ try {
           try { Expand-Archive -Path $dest -DestinationPath $zipOut -Force } catch { Write-Warning "Expand-Archive failed: $dest ($($_.Exception.Message))"; Log 'ZIP_EXPAND_FAIL' "$dest`t$($_.Exception.Message)" }
           $found = (Get-ChildItem $zipOut -Recurse -ErrorAction SilentlyContinue | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
         }
+        # If this is MUSAN and NoiseOnly mode, keep only files within the noise/ category
+        if ($found -and ($dest -match '(?i)musan') -and $MusanMode -eq 'NoiseOnly') {
+          $found = $found | ForEach-Object {
+            try {
+              $rel = $_.Substring($zipOut.Length)
+              $rel = $rel.Replace('\\','/').ToLower()
+              if ($rel -match '/noise/') { $_ } 
+            } catch { }
+          }
+        }
+        # If this is NSynth, keep only guitar family files (jsonwav archives include instrument family in path)
+        if ($found -and ($dest -match '(?i)nsynth')) {
+          $found = $found | ForEach-Object {
+            try {
+              $rel = $_.Substring($zipOut.Length)
+              $rel = $rel.Replace('\\','/').ToLower()
+              if ($rel -match '/guitar/') { $_ }
+            } catch { }
+          }
+        }
         if ($found) { if ($IgnoreAppleResourceForks) { $found = $found | Where-Object { -not ([IO.Path]::GetFileName($_).StartsWith('._')) } }; if ($found -and $found.Count -gt 0) { $outputs += $found; $okCount++ } else { $failCount++ } } else { $failCount++ }
       } elseif ($l.EndsWith('.tar.gz') -or $l.EndsWith('.tgz')) {
         if (Get-Command tar -ErrorAction SilentlyContinue) {
-          $tarHash = [Math]::Abs(($dest).GetHashCode()); $tarOut = Join-Path $subsetDir ("untar_" + $tarHash)
-          New-Item -ItemType Directory -Force -Path $tarOut | Out-Null
+          # Reuse a deterministic untar folder per archive name to avoid creating new folders on each run
+          $tarName = [IO.Path]::GetFileName($dest)
+          if ($tarName.ToLower().EndsWith('.tar.gz')) { $tarBase = $tarName.Substring(0, $tarName.Length - 7) }
+          elseif ($tarName.ToLower().EndsWith('.tgz')) { $tarBase = $tarName.Substring(0, $tarName.Length - 4) }
+          else { $tarBase = [IO.Path]::GetFileNameWithoutExtension($tarName) }
+          $tarSafe = ($tarBase -replace '[^A-Za-z0-9_.-]','_')
+          $tarOut = Join-Path $subsetDir ("untar_" + $tarSafe)
+          if (-not (Test-Path $tarOut)) { New-Item -ItemType Directory -Force -Path $tarOut | Out-Null }
             $found = @()
             if (Test-Path $tarOut) {
               $found = (Get-ChildItem $tarOut -Recurse -ErrorAction SilentlyContinue | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
@@ -445,6 +553,26 @@ try {
             if (-not $found -or $found.Count -eq 0) {
               try { tar -xzf $dest -C $tarOut } catch { Write-Warning "tar extract failed: $dest ($($_.Exception.Message))"; Log 'TAR_EXTRACT_FAIL' "$dest`t$($_.Exception.Message)" }
               $found = (Get-ChildItem $tarOut -Recurse -ErrorAction SilentlyContinue | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
+            }
+            # If this is MUSAN and NoiseOnly mode, keep only files within the noise/ category
+            if ($found -and ($dest -match '(?i)musan') -and $MusanMode -eq 'NoiseOnly') {
+              $found = $found | ForEach-Object {
+                try {
+                  $rel = $_.Substring($tarOut.Length)
+                  $rel = $rel.Replace('\\','/').ToLower()
+                  if ($rel -match '/noise/') { $_ }
+                } catch { }
+              }
+            }
+            # If this is NSynth, keep only guitar family files (jsonwav archives include instrument family in path)
+            if ($found -and ($dest -match '(?i)nsynth')) {
+              $found = $found | ForEach-Object {
+                try {
+                  $rel = $_.Substring($tarOut.Length)
+                  $rel = $rel.Replace('\\','/').ToLower()
+                  if ($rel -match '/guitar/') { $_ }
+                } catch { }
+              }
             }
             if ($found) { if ($IgnoreAppleResourceForks) { $found = $found | Where-Object { -not ([IO.Path]::GetFileName($_).StartsWith('._')) } }; if ($found -and $found.Count -gt 0) { $outputs += $found; $okCount++ } else { $failCount++ } } else { $failCount++ }
         } else { Write-Warning "tar not available; skipping archive $dest"; $failCount++ }
@@ -454,7 +582,7 @@ try {
         Write-Warning "Unsupported file type: $dest"; $failCount++
       }
     }
-    Write-Host "[$subset] successful items: $okCount, failed/empty: $failCount"
+    Write-Host "[$subset] successful items: $okCount (downloaded=$downloadedCount, reused=$reusedCount), failed/empty: $failCount"
     # Ensure an array is always returned (even for 0 or 1 element) to make .Count safe
     return ,$outputs
   }
@@ -491,46 +619,129 @@ try {
       $csvs = Get-ChildItem $dlRoot.FullName -Recurse -Filter 'Medley-solos-DB_metadata.csv' -ErrorAction SilentlyContinue
       if ($csvs) {
         Write-Host "Medley metadata detected; filtering instruments: $($InstrumentAllowList -join ', ')"
-        function Get-MedleyAllowedNames([string[]]$csvPaths, [string[]]$allow) {
-          $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        function Import-CsvSmart([string]$path) {
+          $first = (Get-Content -LiteralPath $path -TotalCount 1)
+          $delim = ','
+          if ($first -and ($first.Split(';').Length -gt $first.Split(',').Length)) { $delim = ';' }
+          return Import-Csv -LiteralPath $path -Delimiter $delim
+        }
+        function Get-MedleyAllowedSpec([string[]]$csvPaths, [string[]]$allow) {
+          $result = [pscustomobject]@{
+            BaseNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+            Suffixes  = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+            UUIDs     = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+          }
           foreach ($csv in $csvPaths) {
-            $rows = Import-Csv $csv
+            $rows = Import-CsvSmart $csv
+            $rowCount = 0; $matchCount = 0
             foreach ($r in $rows) {
+              $rowCount++
               $cols = @()
-              if ($r.PSObject.Properties.Name -contains 'instrument') { $cols += $r.instrument }
-              if ($r.PSObject.Properties.Name -contains 'instrument_family') { $cols += $r.instrument_family }
-              if ($r.PSObject.Properties.Name -contains 'instrument_category') { $cols += $r.instrument_category }
+              foreach ($candCol in @('instrument','instrument_family','instrument_category','instrument_source','instrument_class')) {
+                if ($r.PSObject.Properties.Name -contains $candCol) { $cols += [string]$r.$candCol }
+              }
               $match = $false
-              foreach ($a in $allow) { if ($cols -match $a) { $match = $true; break } }
+              foreach ($a in $allow) { if ($cols -match [Regex]::Escape($a)) { $match = $true; break } }
               if (-not $match) { continue }
+              $matchCount++
               $cand = $null
-              foreach ($k in @('path','audio_filename','filename','file_name','clip_name')) {
-                if ($r.PSObject.Properties.Name -contains $k -and $r.$k) { $cand = $r.$k; break }
+              foreach ($k in @('path','audio_filename','filename','file_name','clip_name','slice_file_name','raw_filename')) {
+                if ($r.PSObject.Properties.Name -contains $k -and $r.$k) { $cand = [string]$r.$k; break }
               }
               if ($cand) {
-                $set.Add([IO.Path]::GetFileName($cand)) | Out-Null
+                # Normalize CSV path (it usually contains forward slashes even on Windows)
+                $candNorm = $cand.Trim().Replace('\\','/')
+                if ($candNorm.StartsWith('./')) { $candNorm = $candNorm.Substring(2) }
+                try {
+                  $bn = [IO.Path]::GetFileName($candNorm)
+                  if ($bn) { $null = $result.BaseNames.Add($bn) }
+                } catch {}
+                # Also store a lower-cased suffix for robust endswith matching against extracted paths
+                $candLower = $candNorm.ToLower()
+                if (-not [string]::IsNullOrWhiteSpace($candLower)) { $null = $result.Suffixes.Add($candLower) }
+              }
+              # Capture UUIDs (authoritative mapping according to dataset docs)
+              $uuid = $null
+              foreach ($uCol in @('uuid4','uuid','uuid_4')) { if ($r.PSObject.Properties.Name -contains $uCol) { $uuid = [string]$r.$uCol; if ($uuid) { break } } }
+              if ($uuid) {
+                $uuid = $uuid.Trim().ToLower()
+                if ($uuid -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { $null = $result.UUIDs.Add($uuid) }
               }
             }
+            Write-Host "  Parsed CSV: $csv (rows=$rowCount, matched_rows=$matchCount)"
           }
-          return $set
+          return $result
         }
-        $allowed = Get-MedleyAllowedNames ($csvs | Select-Object -ExpandProperty FullName) $InstrumentAllowList
+        $spec = Get-MedleyAllowedSpec ($csvs | Select-Object -ExpandProperty FullName) $InstrumentAllowList
         # Limit filtering to files inside the same extraction roots as the metadata CSVs
         $csvRoots = @(); foreach ($c in $csvs) { $csvRoots += (Split-Path -Parent $c.FullName) }
         function Is-UnderAnyRoot([string]$path, [string[]]$roots) {
           $lp = $path.ToLower(); foreach ($r in $roots) { if ($lp.StartsWith($r.ToLower())) { return $true } } return $false
         }
-        if ($allowed -and $allowed.Count -gt 0) {
+        if ($spec.UUIDs.Count -gt 0 -or $spec.BaseNames.Count -gt 0 -or $spec.Suffixes.Count -gt 0) {
           $before = $gFiles.Count
           $medleyFiles = @(); $otherFiles = @()
           foreach ($gf in $gFiles) { if (Is-UnderAnyRoot $gf $csvRoots) { $medleyFiles += $gf } else { $otherFiles += $gf } }
-          $filteredMedley = $medleyFiles | Where-Object { $allowed.Contains([IO.Path]::GetFileName($_)) }
+          $filteredMedley = @()
+          foreach ($mf in $medleyFiles) {
+            $mfNorm = $mf.Replace('\\','/').ToLower()
+            $bn = [IO.Path]::GetFileName($mf)
+            $keep = $false
+            # Prefer UUID-based match
+            if (-not $keep -and $spec.UUIDs.Count -gt 0) {
+              $nameNoExt = [IO.Path]::GetFileNameWithoutExtension($bn)
+              if ($nameNoExt -like '._*') { $nameNoExt = $nameNoExt.Substring(2) }
+              $uuidMatch = Select-String -InputObject $nameNoExt -Pattern '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' -AllMatches | ForEach-Object { $_.Matches } | Select-Object -First 1
+              if ($uuidMatch -and $uuidMatch.Value -and $spec.UUIDs.Contains($uuidMatch.Value.ToLower())) {
+                # Optional extra safety: ensure filename encodes instrument id "-1_"
+                if ($nameNoExt -match '-1_') { $keep = $true } else { $keep = $true }
+              }
+            }
+            if (-not $keep -and $bn -and $spec.BaseNames.Contains($bn)) { $keep = $true }
+            if (-not $keep) {
+              foreach ($suf in $spec.Suffixes) { if ($mfNorm.EndsWith($suf)) { $keep = $true; break } }
+            }
+            if ($keep) { $filteredMedley += $mf }
+          }
           $gFiles = @() + $otherFiles + $filteredMedley
           $keptMedley = ($filteredMedley | Measure-Object).Count
           $medleyCount = ($medleyFiles | Measure-Object).Count
-          Write-Host "Medley CSV filter kept $keptMedley/$medleyCount Medley files; total guitar files now $($gFiles.Count) (was $before)."
+          $mode = if ($spec.UUIDs.Count -gt 0) { 'UUID' } elseif ($spec.BaseNames.Count -gt 0 -or $spec.Suffixes.Count -gt 0) { 'name/suffix' } else { 'unknown' }
+          Write-Host "Medley CSV filter ($mode) kept $keptMedley/$medleyCount Medley files; total guitar files now $($gFiles.Count) (was $before)."
+          if ($keptMedley -eq 0 -and $medleyCount -gt 0) {
+            Write-Warning "Medley CSV present but no files matched allowed instruments. Checked by UUID, basename, and suffix. Verify archive naming and CSV mapping."
+          }
         } else {
-          Write-Host "Medley CSV found but no matching filenames; skipping Medley filter."
+          # Fallback: derive instrument tokens from CSV and filter by directory segments
+          function Sanitize-Token([string]$s) { if (-not $s) { return '' } return ($s.ToLower() -replace '[^a-z0-9]','') }
+          $csvRows = Import-CsvSmart ($csvs[0].FullName)
+          $allowedTokens = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+          foreach ($r in $csvRows) {
+            $cols = @()
+            foreach ($candCol in @('instrument','instrument_family','instrument_category','instrument_source','instrument_class')) {
+              if ($r.PSObject.Properties.Name -contains $candCol) { $cols += [string]$r.$candCol }
+            }
+            $match = $false
+            foreach ($a in $InstrumentAllowList) { if ($cols -match [Regex]::Escape($a)) { $match = $true; break } }
+            if (-not $match) { continue }
+            foreach ($c in $cols) { $null = $allowedTokens.Add((Sanitize-Token $c)) }
+          }
+          if ($allowedTokens.Count -eq 0) { foreach ($a in $InstrumentAllowList) { $null = $allowedTokens.Add((Sanitize-Token $a)) } }
+          Write-Host ("Medley token filter using tokens: {0}" -f ([string]::Join(', ', $allowedTokens)))
+          $before = $gFiles.Count
+          $medleyFiles = @(); $otherFiles = @()
+          foreach ($gf in $gFiles) { if (Is-UnderAnyRoot $gf $csvRoots) { $medleyFiles += $gf } else { $otherFiles += $gf } }
+          $filteredMedley = @()
+          foreach ($mf in $medleyFiles) {
+            $segs = $mf.Replace('\\','/').ToLower().Split('/') | ForEach-Object { ($_ -replace '[^a-z0-9]','') }
+            $keep = $false
+            foreach ($tok in $allowedTokens) { if ($segs -contains $tok) { $keep = $true; break } }
+            if ($keep) { $filteredMedley += $mf }
+          }
+          $gFiles = @() + $otherFiles + $filteredMedley
+          $keptMedley = ($filteredMedley | Measure-Object).Count
+          $medleyCount = ($medleyFiles | Measure-Object).Count
+          Write-Host "Medley path-token filter kept $keptMedley/$medleyCount Medley files; total guitar files now $($gFiles.Count) (was $before)."
         }
       }
     } catch {

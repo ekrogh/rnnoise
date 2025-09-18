@@ -46,6 +46,7 @@ param(
   [string]$GuitarDir = '',
   [string]$InterfereDir = '',
   [switch]$FetchFromUrls = $false,
+  [ValidateSet('All','NoiseOnly')][string]$MusanMode = 'All',
   [string]$GuitarUrls = (Join-Path $PSScriptRoot 'urls_guitar.txt'),
   [string]$NoiseUrls = (Join-Path $PSScriptRoot 'urls_noise.txt'),
   [switch]$AllowInsecure = $false,
@@ -184,6 +185,7 @@ if ($FetchFromUrls) {
     MinSeconds = $MinSeconds
     MaxSeconds = $MaxSeconds
   }
+  if ($MusanMode) { $fetchParams['MusanMode'] = $MusanMode }
   # Prefer Medley CSV instrument filtering and parallel conversion when available
   if ($PreferMedleyCsv) { $fetchParams['PreferMedleyCsv'] = $true }
   if ($InstrumentAllowList -and $InstrumentAllowList.Count -gt 0) { $fetchParams['InstrumentAllowList'] = $InstrumentAllowList }

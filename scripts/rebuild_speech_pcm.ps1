@@ -55,13 +55,18 @@ function Format-ConcatLine([string]$p) {
   $q = $p -replace "'", "\\'"
   "file '$q'"
 }
-Get-ChildItem $GuitarOut -Recurse -Filter *.wav |
-  ForEach-Object { Format-ConcatLine $_.FullName } |
-  Set-Content -Encoding UTF8 $speechList
-Get-ChildItem $NoiseOut  -Recurse -Filter *.wav |
-  ForEach-Object { Format-ConcatLine $_.FullName } |
-  Set-Content -Encoding UTF8 $noiseList
-if (-not (Get-Content $speechList)) { throw "No WAVs found for speech list in $GuitarOut" }
+if (Test-Path $speechList) { Remove-Item $speechList -Force -ErrorAction SilentlyContinue }
+if (Test-Path $noiseList)  { Remove-Item $noiseList  -Force -ErrorAction SilentlyContinue }
+$speechItems = Get-ChildItem $GuitarOut -Recurse -Filter *.wav -File -ErrorAction SilentlyContinue
+if ($speechItems -and $speechItems.Count -gt 0) {
+  $speechItems | ForEach-Object { Format-ConcatLine $_.FullName } | Set-Content -Encoding UTF8 $speechList
+} else {
+  throw "No WAVs found for speech list in $GuitarOut"
+}
+$noiseItems = Get-ChildItem $NoiseOut -Recurse -Filter *.wav -File -ErrorAction SilentlyContinue
+if ($noiseItems -and $noiseItems.Count -gt 0) {
+  $noiseItems | ForEach-Object { Format-ConcatLine $_.FullName } | Set-Content -Encoding UTF8 $noiseList
+}
 
 # 3) Build speech.pcm (48k, mono, s16le)
 Push-Location $RepoRoot

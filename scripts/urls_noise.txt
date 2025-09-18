@@ -5,4 +5,17 @@
 https://www.openslr.org/resources/17/musan.tar.gz
 
 # DEMAND Noise Dataset – real environmental noises (free for research)
+# Primary (Zenodo records API); sometimes flaky with some downloaders
 https://zenodo.org/records/1227121/files/DEMAND_Real_World_Noise_Dataset.zip?download=1
+# Alternate (Zenodo record API w/out files segment)
+https://zenodo.org/record/1227121/DEMAND_Real_World_Noise_Dataset.zip?download=1
+# Alternate filename guess (some mirrors provide explicit .zip without query)
+https://zenodo.org/records/1227121/files/DEMAND_Real_World_Noise_Dataset.zip
+# If the above continue to fail at download time, the fetch script will reuse any existing untar/unzip folder
+# and also attempt downloader fallbacks.
+
+# Optional alternates (commented out by default):
+# FSD50K (CC BY 4.0) – large general-purpose sound events; contains many ambient/noise classes
+# Uncomment one or both lines to include
+# https://zenodo.org/records/4060432/files/FSD50K.dev_audio.zip?download=1
+# https://zenodo.org/records/4060432/files/FSD50K.eval_audio.zip?download=1
