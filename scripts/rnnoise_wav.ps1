@@ -37,9 +37,13 @@ try {
     if ([string]::IsNullOrWhiteSpace($outDir)) {
         $outDir = (Get-Location).Path
     } else {
+        # Create directory if it doesn't exist rather than resolving first
+        if (-not (Test-Path -LiteralPath $outDir)) {
+            New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+        }
+        # Now safely resolve to an absolute path
         $outDir = (Resolve-Path -LiteralPath $outDir).Path
     }
-    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
     $outFull = Join-Path $outDir $outName
     ffmpeg -y -hide_banner -loglevel error -f s16le -ac 1 -ar 48000 -i "$pcmOut" "$outFull"
 

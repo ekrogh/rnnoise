@@ -501,7 +501,7 @@ try {
       $l = $dest.ToLower()
       if ($audioExt | Where-Object { $l.EndsWith($_) }) {
         if ($IgnoreAppleResourceForks -and ([IO.Path]::GetFileName($dest)).StartsWith('._')) { } else { $outputs += $dest; $okCount++ }
-  } elseif ($l.EndsWith('.zip')) {
+      } elseif ($l.EndsWith('.zip')) {
         # Reuse a deterministic unzip folder per archive name to avoid creating new folders on each run
         $zipBase = [IO.Path]::GetFileNameWithoutExtension($dest)
         $zipSafe = ($zipBase -replace '[^A-Za-z0-9_.-]','_')
@@ -512,7 +512,23 @@ try {
           $found = (Get-ChildItem $zipOut -Recurse -ErrorAction SilentlyContinue | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
         }
         if (-not $found -or $found.Count -eq 0) {
-          try { Expand-Archive -Path $dest -DestinationPath $zipOut -Force } catch { Write-Warning "Expand-Archive failed: $dest ($($_.Exception.Message))"; Log 'ZIP_EXPAND_FAIL' "$dest`t$($_.Exception.Message)" }
+          $expanded = $false
+          try { Expand-Archive -Path $dest -DestinationPath $zipOut -Force; $expanded = $true } catch { Write-Warning "Expand-Archive failed: $dest ($($_.Exception.Message))"; Log 'ZIP_EXPAND_FAIL' "$dest`t$($_.Exception.Message)" }
+          # If Expand-Archive failed or yielded nothing, try tar as a fallback (bsdtar supports zip)
+          if (-not $expanded) {
+            if (Get-Command tar -ErrorAction SilentlyContinue) {
+              try { tar -xf "$dest" -C "$zipOut"; $expanded = $true; Write-Host "tar fallback succeeded for ZIP: $dest"; Log 'ZIP_TAR_FALLBACK_OK' "$dest" } catch { Write-Warning "tar fallback failed for ZIP: $dest ($($_.Exception.Message))"; Log 'ZIP_TAR_FALLBACK_FAIL' "$dest`t$($_.Exception.Message)" }
+            }
+          }
+          # If tar also failed or unavailable, try 7z if present
+          if (-not $expanded) {
+            if (Get-Command 7z -ErrorAction SilentlyContinue) {
+              try { & 7z x -y "$dest" -o"$zipOut" | Out-Null; $expanded = $true; Write-Host "7z fallback succeeded for ZIP: $dest"; Log 'ZIP_7Z_FALLBACK_OK' "$dest" } catch { Write-Warning "7z fallback failed for ZIP: $dest ($($_.Exception.Message))"; Log 'ZIP_7Z_FALLBACK_FAIL' "$dest`t$($_.Exception.Message)" }
+            } elseif (Get-Command 7z.exe -ErrorAction SilentlyContinue) {
+              try { & 7z.exe x -y "$dest" -o"$zipOut" | Out-Null; $expanded = $true; Write-Host "7z.exe fallback succeeded for ZIP: $dest"; Log 'ZIP_7Z_FALLBACK_OK' "$dest" } catch { Write-Warning "7z.exe fallback failed for ZIP: $dest ($($_.Exception.Message))"; Log 'ZIP_7Z_FALLBACK_FAIL' "$dest`t$($_.Exception.Message)" }
+            }
+          }
+          if (-not $expanded) { Write-Warning "All ZIP extraction methods failed: $dest"; Log 'ZIP_ALL_EXTRACT_FAIL' "$dest" }
           $found = (Get-ChildItem $zipOut -Recurse -ErrorAction SilentlyContinue | Where-Object { $audioExt -contains ([IO.Path]::GetExtension($_.FullName).ToLower()) } | Select-Object -ExpandProperty FullName)
         }
         # If this is MUSAN and NoiseOnly mode, keep only files within the noise/ category

@@ -23,7 +23,10 @@ param(
   [switch]$CPUOnly = $false,
   [string]$CudaVisibleDevices = '0',
   [string]$GuitarDir = '',
-  [string]$InterfereDir = ''
+  [string]$InterfereDir = '',
+  [switch]$FetchFromUrls = $false,
+  [string]$TempDownloadDir = '',
+  [ValidateSet('All','NoiseOnly')][string]$MusanMode = 'All'
 )
 
 Set-StrictMode -Version Latest
@@ -76,6 +79,9 @@ if ($DataMode -eq 'Real') {
   $p['GuitarDir']    = $GuitarDir
   $p['InterfereDir'] = $InterfereDir
 }
+if ($FetchFromUrls) { $p['FetchFromUrls'] = $true }
+if ($TempDownloadDir -and $TempDownloadDir.Trim() -ne '') { $p['TempDownloadDir'] = $TempDownloadDir }
+if ($MusanMode) { $p['MusanMode'] = $MusanMode }
 
 # Execute pipeline and tee output to log
 & $pipe @p *>&1 | Tee-Object -FilePath $Log -Append
