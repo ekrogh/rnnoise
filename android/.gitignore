@@ -1,0 +1,27 @@
+# IDE
+.idea/
+*.iml
+
+# Gradle
+.gradle/
+/local.properties
+/build/
+
+# Module build outputs
+app/build/
+app/.cxx/
+app/intermediates/
+app/generated/
+
+# CMake/Ninja intermediates
+.cxx/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/build.ninja
+**/.ninja_deps
+**/.ninja_log
+
+# OS
+.DS_Store
+Thumbs.db

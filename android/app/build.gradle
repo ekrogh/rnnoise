@@ -1,0 +1,45 @@
+plugins {
+  id 'com.android.library'
+}
+
+android {
+  namespace 'org.xiph.rnnoise'
+  compileSdk 35
+
+  defaultConfig {
+    minSdk 21
+    targetSdk 35
+    ndk {
+      abiFilters 'arm64-v8a', 'armeabi-v7a'
+    }
+    externalNativeBuild {
+      cmake {
+        // arguments are forced inside the CMake file already
+      }
+    }
+    consumerProguardFiles 'consumer-rules.pro'
+  }
+
+  buildTypes {
+    release {
+      minifyEnabled false
+      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+    }
+    debug {
+      debuggable true
+    }
+  }
+
+  externalNativeBuild {
+    cmake {
+      path file('src/main/cpp/CMakeLists.txt')
+    }
+  }
+
+  buildFeatures {
+    prefab false
+  }
+}
+
+dependencies {
+}
