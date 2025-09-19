@@ -495,6 +495,13 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
       static float scale_exp = GUITAR_SCALE_EXP;
       static float up_damp = GUITAR_UP_DAMP;
       static float smooth_alpha = GUITAR_SMOOTH_ALPHA;
+      static int bypass_gate = 0; /* 1 => disable guitar gating */
+      static int debug_gate = 0;  /* 1 => print debug info occasionally */
+      static int dbg_counter = 0;
+      static int act_source = 0; /* 0=vad,1=mid,2=blend */
+      static int auto_floor = 0; /* enable adaptive min_scale floor */
+      static float observed_act_sum = 0.f;
+      static int observed_frames = 0;
       if (!env_loaded) {
         const char *e;
         if ((e = getenv("RN_GUITAR_GATE_THRESH"))) gate_thresh = (float)atof(e);
@@ -502,6 +509,14 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
         if ((e = getenv("RN_GUITAR_SCALE_EXP")))  scale_exp   = (float)atof(e);
         if ((e = getenv("RN_GUITAR_UP_DAMP")))    up_damp     = (float)atof(e);
         if ((e = getenv("RN_GUITAR_SMOOTH_ALPHA"))) smooth_alpha = (float)atof(e);
+        if ((e = getenv("RN_GUITAR_BYPASS"))) bypass_gate = atoi(e)!=0;
+        if ((e = getenv("RN_GUITAR_DEBUG"))) debug_gate = atoi(e)!=0;
+        if ((e = getenv("RN_GUITAR_ACT_SOURCE"))) {
+          if (strcmp(e, "mid") == 0) act_source = 1;
+          else if (strcmp(e, "blend") == 0) act_source = 2;
+          else act_source = 0; /* default to vad */
+        }
+        if ((e = getenv("RN_GUITAR_AUTO_FLOOR"))) auto_floor = atoi(e)!=0;
         if (gate_thresh < 0.05f) gate_thresh = 0.05f; if (gate_thresh > 0.95f) gate_thresh = 0.95f;
         if (min_scale < 0.f) min_scale = 0.f; if (min_scale > 0.9f) min_scale = 0.9f;
         if (scale_exp < 0.5f) scale_exp = 0.5f; if (scale_exp > 5.f) scale_exp = 5.f;
@@ -509,24 +524,74 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
         if (smooth_alpha < 0.f) smooth_alpha = 0.f; if (smooth_alpha > 0.95f) smooth_alpha = 0.95f;
         env_loaded = 1;
       }
-      float act = vad_prob; if (act < 0.f) act = 0.f; if (act > 1.f) act = 1.f;
-      float scale = 1.f;
-      if (act < gate_thresh) {
-        float ratio = act / gate_thresh;
-        float shaped = powf(ratio, scale_exp);
-        scale = min_scale + (1.f - min_scale)*shaped;
-      }
-      for (i=0;i<NB_BANDS;i++) {
-        float prev = st->lastg[i];
-        float cur = g[i];
-        if (scale < 1.f && cur > prev && act < gate_thresh*0.7f) {
-          cur = prev + (cur - prev)*scale*up_damp;
-        } else {
-          cur *= scale;
+      /* Derive mid-band energy ratio (approx guitar presence) if requested */
+      float act_vad = vad_prob;
+      if (act_vad < 0.f) act_vad = 0.f; if (act_vad > 1.f) act_vad = 1.f;
+      float act_mid = act_vad;
+      if (act_source != 0) {
+        /* Mid band ~300-3500 Hz: approximate using band indices overlapping that range. */
+        /* Band edges in eband20ms relate to FFT bin indices (48kHz, 20ms). We approximate.
+           We'll treat bands whose center bin frequency is in the interval as mid. */
+        int mid_lo_hz = 300;
+        int mid_hi_hz = 3500;
+        float mid_energy = 0.f;
+        float total_energy = 0.f;
+        for (i=0;i<NB_BANDS;i++) {
+          /* Approximate center frequency in Hz */
+          int lo = eband20ms[i];
+            int hi = eband20ms[i+1];
+            float center_bin = 0.5f*(lo+hi);
+            float center_hz = (48000.f/2.f) * (center_bin / (float)FREQ_SIZE); /* Nyquist scaled */
+            float e = Ex[i];
+            total_energy += e;
+            if (center_hz >= mid_lo_hz && center_hz <= mid_hi_hz) mid_energy += e;
         }
-        /* Additional smoothing to prevent sudden expansion */
-        cur = MAX16(cur, smooth_alpha*prev);
-        g[i] = cur;
+        if (total_energy > 1e-12f) act_mid = mid_energy / total_energy; else act_mid = 0.f;
+        if (act_mid < 0.f) act_mid = 0.f; if (act_mid > 1.f) act_mid = 1.f;
+      }
+      float act;
+      if (act_source == 1) act = act_mid;              /* mid */
+      else if (act_source == 2) act = 0.5f*act_vad + 0.5f*act_mid; /* blend */
+      else act = act_vad; /* vad */
+      /* Adaptive floor: after initial frames, if activation is consistently low, raise min_scale */
+      if (!bypass_gate && auto_floor) {
+        if (observed_frames < 400) { /* ~8 seconds at 50 fps */
+          observed_act_sum += act;
+          observed_frames++;
+          if (observed_frames == 200) {
+            float mean_act = observed_act_sum / observed_frames;
+            if (mean_act < 0.15f && min_scale < 0.30f) {
+              min_scale = 0.30f; /* lift floor */
+            }
+          }
+        }
+      }
+      float scale = 1.f;
+      if (!bypass_gate) {
+        if (act < gate_thresh) {
+          float ratio = act / gate_thresh;
+          float shaped = powf(ratio, scale_exp);
+          scale = min_scale + (1.f - min_scale)*shaped;
+        }
+        for (i=0;i<NB_BANDS;i++) {
+          float prev = st->lastg[i];
+            float cur = g[i];
+            if (scale < 1.f && cur > prev && act < gate_thresh*0.7f) {
+              cur = prev + (cur - prev)*scale*up_damp;
+            } else {
+              cur *= scale;
+            }
+            /* Additional smoothing to prevent sudden expansion */
+            cur = MAX16(cur, smooth_alpha*prev);
+            g[i] = cur;
+        }
+      }
+      if (debug_gate) {
+        dbg_counter++;
+        if ((dbg_counter & 63) == 0) {
+          fprintf(stderr, "[guitar_gate] act=%.3f (vad=%.3f mid=%.3f src=%d) scale=%.3f bypass=%d thresh=%.2f min=%.2f exp=%.2f up=%.2f smooth=%.2f auto_floor=%d\n",
+            act, act_vad, act_mid, act_source, scale, bypass_gate, gate_thresh, min_scale, scale_exp, up_damp, smooth_alpha, auto_floor);
+        }
       }
     }
 #endif
