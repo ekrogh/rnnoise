@@ -50,6 +50,8 @@ param(
   [string]$GuitarOut = (Join-Path (Resolve-Path .).Path 'data/guitar_clean'),
   [string]$NoiseOut  = (Join-Path (Resolve-Path .).Path 'data/interfere'),
   [ValidateSet('All','NoiseOnly')][string]$MusanMode = 'All',
+  # If set, include NON-guitar instrument families from NSynth archives as interference (noise) sources.
+  [switch]$IncludeNSynthNonGuitar,
   [ValidateSet('Auto','Builtin','Aria2c')][string]$Downloader = 'Auto',
   [switch]$ShowDownloadProgress,
   [int]$MinSeconds = 0,
@@ -548,6 +550,7 @@ try {
               $rel = $_.Substring($zipOut.Length)
               $rel = $rel.Replace('\\','/').ToLower()
               if ($rel -match '/guitar/') { $_ }
+              elseif ($IncludeNSynthNonGuitar) { $_ }
             } catch { }
           }
         }
@@ -587,6 +590,7 @@ try {
                   $rel = $_.Substring($tarOut.Length)
                   $rel = $rel.Replace('\\','/').ToLower()
                   if ($rel -match '/guitar/') { $_ }
+                  elseif ($IncludeNSynthNonGuitar) { $_ }
                 } catch { }
               }
             }
