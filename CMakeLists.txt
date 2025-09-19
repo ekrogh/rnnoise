@@ -105,6 +105,7 @@ option(BUILD_EXAMPLES "Build examples (rnnoise_demo)" OFF)
 option(BUILD_TOOLS "Build tools (dump_features, dump_weights_blob)" OFF)
 option(ENABLE_SSE4_1 "Enable SSE4.1 optimized sources" OFF)
 option(ENABLE_AVX2 "Enable AVX2 optimized sources" OFF)
+option(GUITAR_ISOLATION_MODE "Enable guitar isolation gating logic in rnnoise_process_frame" OFF)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -149,6 +150,11 @@ add_library(rnnoise STATIC ${RNNOISE_SOURCES})
 target_include_directories(rnnoise PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 target_compile_definitions(rnnoise PRIVATE HAVE_CONFIG_H)
+
+if(GUITAR_ISOLATION_MODE)
+    target_compile_definitions(rnnoise PUBLIC GUITAR_ISOLATION_MODE)
+    message(STATUS "Guitar isolation mode enabled (GUITAR_ISOLATION_MODE=1)")
+endif()
 
 # Xcode: generate only the rnnoise scheme and hide CMake helper schemes
 if(CMAKE_GENERATOR STREQUAL "Xcode")
