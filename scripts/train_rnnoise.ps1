@@ -33,7 +33,8 @@ param(
   [int]$MaxConcatSecondsSpeech = 0,
   [int]$MaxConcatSecondsNoise = 0,
   [switch]$ForceRegenFeatures = $false,
-  [string]$BuildType = 'Release'
+  [string]$BuildType = 'Release',
+  [switch]$EvalOnly = $false
 )
 
 <#
@@ -86,44 +87,47 @@ function Invoke-FetchIfNeeded {
     FfmpegThreadsPerJob = $FfmpegThreadsPerJob; IgnoreAppleResourceForks = $IgnoreAppleResourceForks;
   }
   if ($WriteDatasetSummary) { $params['WriteDatasetSummary'] = $true }
-  & pwsh $fetch @params
+  & $fetch @params
 }
 
 Invoke-FetchIfNeeded
 
 # Export gating env vars (runtime; training not affected but evaluation & demo will use them)
-$env:RN_GUITAR_GATE_THRESH = '{0:F3}' -f $GateThresh
-$env:RN_GUITAR_MIN_SCALE   = '{0:F3}' -f $GateMinScale
-$env:RN_GUITAR_SCALE_EXP   = '{0:F3}' -f $GateScaleExp
-$env:RN_GUITAR_UP_DAMP     = '{0:F3}' -f $GateUpDamp
-$env:RN_GUITAR_SMOOTH_ALPHA= '{0:F3}' -f $GateSmoothAlpha
-Write-Host ("[train] Gating env: thresh={0} min={1} exp={2} up={3} smooth={4}" -f $GateThresh,$GateMinScale,$GateScaleExp,$GateUpDamp,$GateSmoothAlpha)
+$ci = [System.Globalization.CultureInfo]::InvariantCulture
+$env:RN_GUITAR_GATE_THRESH = $GateThresh.ToString($ci)
+$env:RN_GUITAR_MIN_SCALE   = $GateMinScale.ToString($ci)
+$env:RN_GUITAR_SCALE_EXP   = $GateScaleExp.ToString($ci)
+$env:RN_GUITAR_UP_DAMP     = $GateUpDamp.ToString($ci)
+$env:RN_GUITAR_SMOOTH_ALPHA= $GateSmoothAlpha.ToString($ci)
+Write-Host ("[train] Gating env: thresh={0} min={1} exp={2} up={3} smooth={4}" -f $env:RN_GUITAR_GATE_THRESH,$env:RN_GUITAR_MIN_SCALE,$env:RN_GUITAR_SCALE_EXP,$env:RN_GUITAR_UP_DAMP,$env:RN_GUITAR_SMOOTH_ALPHA)
 
 # Delegate heavy lifting to pipeline script to avoid duplication
 $pipeline = Join-Path $RepoRoot 'scripts/pipeline_guitar.ps1'
 if (-not (Test-Path $pipeline)) { throw "pipeline_guitar.ps1 not found at $pipeline" }
 
-$pipeArgs = @(
-  '-DataMode','Real',
-  '-GuitarDir', $GuitarOut,
-  '-InterfereDir', $NoiseOut,
-  '-FeatureCount', $FeatureCount,
-  '-Epochs', $Epochs,
-  '-BatchSize', $BatchSize,
-  '-SequenceLength', $SequenceLength,
-  '-CondSize', $CondSize,
-  '-GruSize', $GruSize,
-  '-Threads', $Threads,
-  '-MaxConcatSecondsSpeech', $MaxConcatSecondsSpeech,
-  '-MaxConcatSecondsNoise', $MaxConcatSecondsNoise,
-  '-BuildType', $BuildType
-)
-if ($ForceRegenFeatures) { $pipeArgs += '-ForceRegenFeatures' }
-if ($CPUOnly) { $pipeArgs += '-CPUOnly' } else { $pipeArgs += '-CPUOnly:$false' }
-$pipeArgs += '-EnableGuitarIsolation'
-if ($RunEval) { $pipeArgs += @('-RunEval','-EvalLimit', $EvalLimit) }
+$pipeParams = @{
+  DataMode = 'Real'
+  GuitarDir = $GuitarOut
+  InterfereDir = $NoiseOut
+  FeatureCount = $FeatureCount
+  Epochs = $Epochs
+  BatchSize = $BatchSize
+  SequenceLength = $SequenceLength
+  CondSize = $CondSize
+  GruSize = $GruSize
+  Threads = $Threads
+  MaxConcatSecondsSpeech = $MaxConcatSecondsSpeech
+  MaxConcatSecondsNoise  = $MaxConcatSecondsNoise
+  BuildType = $BuildType
+  EnableGuitarIsolation = $true
+  RunEval = $RunEval
+  EvalLimit = $EvalLimit
+}
+if ($ForceRegenFeatures) { $pipeParams['ForceRegenFeatures'] = $true }
+if (-not $CPUOnly) { $pipeParams['CPUOnly'] = $false }
+if ($EvalOnly) { $pipeParams['EvalOnly'] = $true }
 
-Write-Host '[train] Launching pipeline_guitar.ps1 ...'
-& pwsh $pipeline @pipeArgs
+Write-Host '[train] Launching pipeline_guitar.ps1 with named parameters...'
+& $pipeline @pipeParams
 
 Write-Host '[train] Completed.'
