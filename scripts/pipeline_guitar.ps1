@@ -70,7 +70,17 @@ param(
   [int]$Threads = 0,
   [int]$MaxConcatSecondsSpeech = 0,
   [int]$MaxConcatSecondsNoise = 0,
-  [switch]$ForceRegenFeatures = $false
+  [switch]$ForceRegenFeatures = $false,
+  # --- New guitar isolation & evaluation flags ---
+  [switch]$EnableGuitarIsolation = $true,
+  [string]$GateThresh = '0.42',
+  [string]$GateMinScale = '0.10',
+  [string]$GateScaleExp = '2.0',
+  [string]$GateUpDamp = '0.45',
+  [string]$GateSmoothAlpha = '0.60',
+  [switch]$RunEval = $false,
+  [int]$EvalLimit = 4,
+  [string]$EvalOutput = 'eval_metrics.json'
 )
 
 Set-StrictMode -Version Latest
@@ -134,8 +144,10 @@ except Exception:
 }
 
 # Resolve input data strategy
-$DefaultGuitar = Join-Path $RepoRoot 'data/guitar_clean'
-$DefaultNoise  = Join-Path $RepoRoot 'data/interfere'
+# $DefaultGuitar = Join-Path $RepoRoot 'data/guitar_clean'
+# $DefaultNoise  = Join-Path $RepoRoot 'data/interfere'
+$DefaultGuitar = 'E:\rnnoise_data\guitar_clean'
+$DefaultNoise  = 'E:\rnnoise_data\interfere'
 
 $UseSynth = $false
 if ($DataMode -eq 'Real' -or ($GuitarDir -ne '' -or $InterfereDir -ne '')) {
@@ -246,7 +258,7 @@ finally { Pop-Location }
 # 5) Build dump_features tool
 $BuildDir = Join-Path $RepoRoot 'build'
 Write-Host "Configuring CMake with tools and examples..."
-cmake -S $RepoRoot -B $BuildDir -DBUILD_TOOLS=ON -DBUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=$BuildType | Out-Null
+cmake -S $RepoRoot -B $BuildDir -DBUILD_TOOLS=ON -DBUILD_EXAMPLES=ON -DGUITAR_ISOLATION_MODE=ON -DCMAKE_BUILD_TYPE=$BuildType | Out-Null
 Write-Host "Building dump_features..."
 cmake --build $BuildDir --config $BuildType --target dump_features | Out-Null
 
@@ -327,6 +339,33 @@ cmake --build $BuildDir --config $BuildType --target rnnoise | Out-Null
 # 9) Build example CLI (rnnoise_demo)
 Write-Host "Building rnnoise_demo example..."
 cmake --build $BuildDir --config $BuildType --target rnnoise_demo | Out-Null
+
+# After building rnnoise_demo add evaluation & gating export
+# Set environment variables for gating if enabled
+if ($EnableGuitarIsolation) {
+  $env:RN_GUITAR_GATE_THRESH = $GateThresh
+  $env:RN_GUITAR_MIN_SCALE = $GateMinScale
+  $env:RN_GUITAR_SCALE_EXP = $GateScaleExp
+  $env:RN_GUITAR_UP_DAMP = $GateUpDamp
+  $env:RN_GUITAR_SMOOTH_ALPHA = $GateSmoothAlpha
+  Write-Host "Guitar isolation gating env vars set: thresh=$GateThresh min=$GateMinScale exp=$GateScaleExp up=$GateUpDamp smooth=$GateSmoothAlpha"
+}
+
+# Optional evaluation step
+if ($RunEval) {
+  $evalScript = Join-Path $RepoRoot 'scripts/evaluate_isolation.py'
+  if (Test-Path $evalScript) {
+    Write-Host "Running evaluation (limit=$EvalLimit)..."
+    & $Py $evalScript --limit $EvalLimit --out $EvalOutput 2>$null
+    if (Test-Path $EvalOutput) {
+      Write-Host "Evaluation metrics written to $EvalOutput"
+    } else {
+      Write-Warning "Evaluation output file not produced."
+    }
+  } else {
+    Write-Warning "Evaluation script not found: $evalScript"
+  }
+}
 
 Write-Host "All done. Outputs:"
 Write-Host " - features: $RepoRoot\features.f32"

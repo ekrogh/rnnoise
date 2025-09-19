@@ -118,7 +118,18 @@ if(MSVC)
     add_compile_definitions(_USE_MATH_DEFINES=1 M_PI=3.14159265358979323846)
 endif()
 
-# Core sources (from the Makefile's RNNOISE_SOURCES)
+# Resolve location of rnnoise_tables.c (supports LFS relocation)
+set(RNNOISE_TABLES_FILE "")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/rnnoise_tables.c")
+    set(RNNOISE_TABLES_FILE src/rnnoise_tables.c)
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rnnoise_LFS/src/rnnoise_tables.c")
+    set(RNNOISE_TABLES_FILE rnnoise_LFS/src/rnnoise_tables.c)
+    message(STATUS "Using rnnoise_LFS/src/rnnoise_tables.c")
+else()
+    message(FATAL_ERROR "rnnoise_tables.c not found in src/ or rnnoise_LFS/src/. The build cannot proceed.")
+endif()
+
+# Core sources (from the Makefile's RNNOISE_SOURCES) - defer rnnoise_tables.c until after detection
 set(RNNOISE_SOURCES
     src/denoise.c
     src/rnn.c
@@ -129,7 +140,7 @@ set(RNNOISE_SOURCES
     src/nnet_default.c
     src/parse_lpcnet_weights.c
     src/rnnoise_data.c
-    src/rnnoise_tables.c
+    ${RNNOISE_TABLES_FILE}
 )
 
 # Optional x86 optimized implementations
@@ -235,7 +246,8 @@ endif()
 
 # Tools
 if(BUILD_TOOLS)
-    add_executable(dump_features src/dump_features.c src/denoise.c src/pitch.c src/celt_lpc.c src/kiss_fft.c src/parse_lpcnet_weights.c src/rnnoise_tables.c)
+    # Use the resolved ${RNNOISE_TABLES_FILE} so LFS relocation works here too
+    add_executable(dump_features src/dump_features.c src/denoise.c src/pitch.c src/celt_lpc.c src/kiss_fft.c src/parse_lpcnet_weights.c ${RNNOISE_TABLES_FILE})
     target_compile_definitions(dump_features PRIVATE TRAINING)
     target_link_libraries(dump_features PRIVATE ${CMAKE_DL_LIBS})
 
