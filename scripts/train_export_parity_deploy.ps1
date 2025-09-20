@@ -51,7 +51,9 @@ param(
   # Show verbose pip output for dependency installs
   [switch]$VerboseDeps,
   # Directory containing training Python package (default 'torch' but recommend renaming to avoid PyTorch shadowing)
-  [string]$TrainDir = 'torch'
+  [string]$TrainDir = 'torch',
+  # Prefer installing / using a CUDA-enabled PyTorch build (falls back to CPU automatically)
+  [switch]$PreferGPU
 )
 
 $ErrorActionPreference = 'Stop'
@@ -146,24 +148,57 @@ if($AutoInstallDeps) {
     Write-Host "Try manual: $PythonExe -m pip install $($stillMissing -join ' ')" -ForegroundColor Red
     exit 1
   }
-  # Attempt to distinguish between real PyTorch and local 'torch' folder (name collision)
+  # Attempt to distinguish between real PyTorch and local 'torch' folder (name collision) and optionally install CUDA build
+  $wantGpu = $PreferGPU -or [bool]$env:USE_GPU
   & $PythonExe -c "import sys,os; import torch; import types; ok = all(hasattr(torch,a) for a in ('__version__','nn','tensor')); print('TORCH_STATUS', 'OK' if ok else 'PLACEHOLDER', getattr(torch,'__file__',None)); sys.exit(0 if ok else 1)" 2>$null
   if($LASTEXITCODE -ne 0) {
-    Write-Host "Installing real PyTorch (CPU wheel) - local placeholder detected or missing." -ForegroundColor Yellow
-    if($VerboseDeps) { & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/cpu }
-    else { & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/cpu | Out-Null }
-    & $PythonExe -c "import sys; import torch; import torch.nn as nn; ok = all(hasattr(torch,a) for a in ('__version__','nn','tensor')); print('TORCH_POST_INSTALL', ok, getattr(torch,'__version__','?'), getattr(torch,'__file__',None)); sys.exit(0 if ok else 1)" 2>$null
+    if($wantGpu) {
+      Write-Host "Trying CUDA PyTorch wheel (cu121)" -ForegroundColor Yellow
+      if($VerboseDeps) { & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/cu121 }
+      else { & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/cu121 | Out-Null }
+    }
+    # Test import after possible CUDA attempt
+    & $PythonExe -c "import torch,sys; sys.exit(0 if hasattr(torch,'nn') else 1)" 2>$null
     if($LASTEXITCODE -ne 0) {
-      Write-Host "PyTorch CPU wheel install failed; trying generic index." -ForegroundColor Yellow
+      Write-Host "Falling back to CPU PyTorch wheel" -ForegroundColor Yellow
+      if($VerboseDeps) { & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/cpu }
+      else { & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/cpu | Out-Null }
+    }
+    # Final fallback generic index
+    & $PythonExe -c "import torch,sys; sys.exit(0 if hasattr(torch,'nn') else 1)" 2>$null
+    if($LASTEXITCODE -ne 0) {
+      Write-Host "Generic index fallback attempt..." -ForegroundColor Yellow
       if($VerboseDeps) { & $PythonExe -m pip install torch --upgrade }
       else { & $PythonExe -m pip install torch --upgrade | Out-Null }
-      & $PythonExe -c "import sys; import torch; ok = all(hasattr(torch,a) for a in ('__version__','nn','tensor')); print('TORCH_POST_FALLBACK', ok, getattr(torch,'__version__','?'), getattr(torch,'__file__',None)); sys.exit(0 if ok else 1)" 2>$null
+    }
+  }
+  # Diagnostics
+  & $PythonExe -c "import torch; print('TORCH_FINAL', getattr(torch,'__version__','?'), 'cuda_avail', torch.cuda.is_available())" 2>$null
+  if($wantGpu) { & $PythonExe -c "import torch; import sys; print('CUDA_DEVICE', (torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a'))" 2>$null }
+
+  # Remedial attempt: user prefers GPU but current install lacks CUDA; force reinstall CUDA wheel
+  if($wantGpu) {
+    & $PythonExe -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>$null
+    if($LASTEXITCODE -ne 0) {
+      $cudaChannel = if($env:CUDA_WHEEL_CHANNEL) { $env:CUDA_WHEEL_CHANNEL } else { 'cu121' }
+      Write-Host "CUDA not available after initial install. Forcing reinstall from channel '$cudaChannel'." -ForegroundColor Yellow
+      if($VerboseDeps) { & $PythonExe -m pip install --force-reinstall --no-cache-dir torch --index-url https://download.pytorch.org/whl/$cudaChannel }
+      else { & $PythonExe -m pip install --force-reinstall --no-cache-dir torch --index-url https://download.pytorch.org/whl/$cudaChannel | Out-Null }
+      & $PythonExe -c "import torch; print('TORCH_RECHECK', getattr(torch,'__version__','?'), 'cuda_avail', torch.cuda.is_available())" 2>$null
+      & $PythonExe -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>$null
       if($LASTEXITCODE -ne 0) {
-        Write-Host "FAILED: Could not obtain real PyTorch. A directory named 'torch' in the repo may be shadowing the package." -ForegroundColor Red
-        Write-Host "Rename the local 'torch' folder (e.g. to 'rnnoise_train') then re-run." -ForegroundColor Red
-        exit 1
+        Write-Host "WARNING: CUDA still unavailable. Proceeding with CPU training." -ForegroundColor Yellow
+      } else {
+        & $PythonExe -c "import torch; print('CUDA_DEVICE', (torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a'))" 2>$null
       }
     }
+  }
+
+  & $PythonExe -c "import torch,sys; sys.exit(0 if hasattr(torch,'nn') else 1)" 2>$null
+  if($LASTEXITCODE -ne 0) {
+    Write-Host "FAILED: Could not obtain functional PyTorch. Potential local 'torch' directory shadowing." -ForegroundColor Red
+    Write-Host "Rename local 'torch' dir (e.g. rnnoise_train) and re-run with -TrainDir rnnoise_train" -ForegroundColor Red
+    exit 1
   }
   if($WriteRequirements) {
     $reqFile = Join-Path $OutputDir "requirements_training.txt"

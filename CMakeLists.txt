@@ -263,6 +263,12 @@ if(BUILD_EXAMPLES)
         # Define flag so code can conditionally compile features if desired
         target_compile_definitions(eks_rnnoise_demo PRIVATE RNNOISE_EXPERIMENTAL_EKS_DEMO=1)
     endif()
+    # ONNX-capable minimal demo (loads model.onnx when PURE_ONNX build)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/eks_rnnoise_demo_onnx.c")
+        add_executable(eks_rnnoise_demo_onnx examples/eks_rnnoise_demo_onnx.c)
+        target_link_libraries(eks_rnnoise_demo_onnx PRIVATE rnnoise)
+        # No extra defs; behavior controlled by PURE_ONNX and RNNOISE_PURE_ONNX
+    endif()
 endif()
 
 # Tools
