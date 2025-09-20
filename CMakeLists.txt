@@ -105,6 +105,7 @@ option(BUILD_EXAMPLES "Build examples (rnnoise_demo)" OFF)
 option(BUILD_TOOLS "Build tools (dump_features, dump_weights_blob)" OFF)
 option(ENABLE_SSE4_1 "Enable SSE4.1 optimized sources" OFF)
 option(ENABLE_AVX2 "Enable AVX2 optimized sources" OFF)
+option(PURE_ONNX "Build only ONNX-based inference (strip embedded RNNoise weights/code)" OFF)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -120,16 +121,38 @@ endif()
 # Core sources (from the Makefile's RNNOISE_SOURCES)
 set(RNNOISE_SOURCES
     src/denoise.c
-    src/rnn.c
     src/pitch.c
     src/kiss_fft.c
     src/celt_lpc.c
-    src/nnet.c
-    src/nnet_default.c
-    src/parse_lpcnet_weights.c
-    src/rnnoise_data.c
     src/rnnoise_tables.c
 )
+
+if(NOT PURE_ONNX)
+    list(APPEND RNNOISE_SOURCES
+        src/rnn.c
+        src/nnet.c
+        src/nnet_default.c
+        src/parse_lpcnet_weights.c
+        src/rnnoise_data.c)
+else()
+    message(STATUS "PURE_ONNX=ON: Excluding embedded RNNoise network sources; expect external ONNX API usage.")
+    add_compile_definitions(RNNOISE_PURE_ONNX=1)
+    # Add ONNX inference source stub (to be created)
+    list(APPEND RNNOISE_SOURCES src/onnx_infer.c)
+    # Attempt to locate ONNX Runtime (can be overridden by user-specified paths)
+    set(ONNXRUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/external/onnxruntime" CACHE PATH "Path to ONNX Runtime root (with include/ and lib/)")
+    find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_c_api.h
+              HINTS ${ONNXRUNTIME_ROOT}/include ENV ONNXRUNTIME_INCLUDE_DIR)
+    find_library(ONNXRUNTIME_LIB onnxruntime
+                 HINTS ${ONNXRUNTIME_ROOT}/lib ${ONNXRUNTIME_ROOT}/lib64 ENV ONNXRUNTIME_LIB_DIR)
+    if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIB)
+        message(STATUS "Found ONNX Runtime: ${ONNXRUNTIME_INCLUDE_DIR}, lib: ${ONNXRUNTIME_LIB}")
+        set(HAVE_ONNXRUNTIME TRUE)
+    else()
+        message(STATUS "ONNX Runtime not found (set ONNXRUNTIME_ROOT or *_INCLUDE_DIR / *_LIB_DIR); building stub implementation.")
+        set(HAVE_ONNXRUNTIME FALSE)
+    endif()
+endif()
 
 # Optional x86 optimized implementations
 if(ENABLE_SSE4_1)
@@ -149,6 +172,14 @@ add_library(rnnoise STATIC ${RNNOISE_SOURCES})
 target_include_directories(rnnoise PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 target_compile_definitions(rnnoise PRIVATE HAVE_CONFIG_H)
+if(PURE_ONNX)
+    target_compile_definitions(rnnoise PUBLIC RNNOISE_PURE_ONNX=1)
+    if(HAVE_ONNXRUNTIME)
+        target_include_directories(rnnoise PUBLIC ${ONNXRUNTIME_INCLUDE_DIR})
+        target_link_libraries(rnnoise PUBLIC ${ONNXRUNTIME_LIB})
+        target_compile_definitions(rnnoise PUBLIC RNNOISE_ONNX_RUNTIME=1)
+    endif()
+endif()
 
 # Xcode: generate only the rnnoise scheme and hide CMake helper schemes
 if(CMAKE_GENERATOR STREQUAL "Xcode")
@@ -247,6 +278,12 @@ if(BUILD_TOOLS)
     # Runtime smoke test: prints selected architecture
     add_executable(rnnoise_smoke tools/rnnoise_smoke.c)
     target_link_libraries(rnnoise_smoke PRIVATE rnnoise)
+    if(PURE_ONNX)
+        add_executable(onnx_parity_probe tools/onnx_parity_probe.c)
+        target_link_libraries(onnx_parity_probe PRIVATE rnnoise)
+    endif()
+    add_executable(dump_features_gains tools/dump_features_gains.c)
+    target_link_libraries(dump_features_gains PRIVATE rnnoise)
 endif()
 
 # Installation (optional)
@@ -260,7 +297,7 @@ if(NOT CMAKE_SKIP_INSTALL_RULES)
 endif()
 
 # Simple helper target to show configuration
-message(STATUS "rnnoise: BUILD_EXAMPLES=${BUILD_EXAMPLES} BUILD_TOOLS=${BUILD_TOOLS} ENABLE_SSE4_1=${ENABLE_SSE4_1} ENABLE_AVX2=${ENABLE_AVX2}")
+message(STATUS "rnnoise: BUILD_EXAMPLES=${BUILD_EXAMPLES} BUILD_TOOLS=${BUILD_TOOLS} ENABLE_SSE4_1=${ENABLE_SSE4_1} ENABLE_AVX2=${ENABLE_AVX2} PURE_ONNX=${PURE_ONNX}")
 
 # ----------------------------------------------------------------------------
 # Xcode helpers (macOS and iOS)

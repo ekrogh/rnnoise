@@ -40,7 +40,11 @@
 #include "rnnoise.h"
 #include "pitch.h"
 #include "arch.h"
+#ifndef RNNOISE_PURE_ONNX
 #include "rnn.h"
+#else
+#include "onnx_infer.h"
+#endif
 #include "cpu_support.h"
 
 #define SQUARE(x) ((x)*(x))
@@ -66,9 +70,14 @@ const int eband20ms[NB_BANDS+2] = {
 
 
 struct DenoiseState {
+#ifndef RNNOISE_PURE_ONNX
   RNNoise model;
 #if !TRAINING
   int arch;
+#endif
+#else
+  OnnxDenoiser *onnx;
+  int onnx_ok;
 #endif
   float analysis_mem[FRAME_SIZE];
   int memid;
@@ -284,7 +293,12 @@ int rnnoise_get_frame_size() {
 
 int rnnoise_init(DenoiseState *st, RNNModel *model) {
   memset(st, 0, sizeof(*st));
-#if !TRAINING
+#if defined(RNNOISE_PURE_ONNX)
+  (void)model;
+  st->onnx = NULL;
+  st->onnx_ok = 0; /* Requires explicit ONNX init (see rnnoise_pure_onnx_load) */
+#else
+# if !TRAINING
   if (model != NULL) {
     WeightArray *list;
     int ret = 1;
@@ -295,15 +309,16 @@ int rnnoise_init(DenoiseState *st, RNNModel *model) {
     }
     if (ret != 0) return -1;
   }
-#ifndef USE_WEIGHTS_FILE
+#  ifndef USE_WEIGHTS_FILE
   else {
     int ret = init_rnnoise(&st->model, rnnoise_arrays);
     if (ret != 0) return -1;
   }
-#endif
+#  endif
   st->arch = rnn_select_arch();
-#else
+# else
   (void)model;
+# endif
 #endif
   return 0;
 }
@@ -472,8 +487,29 @@ static float rnnoise_internal_process_frame(DenoiseState *st, float *out, const 
   silence = rnn_compute_frame_features(st, X, P, Ex, Ep, Exp, features, x);
 
   if (!silence) {
-#if !TRAINING
+#if defined(RNNOISE_PURE_ONNX)
+    /* Build 65-dim feature vector from existing NB_FEATURES (2*NB_BANDS+1 = 65) */
+    float feat65[65];
+    if (NB_FEATURES != 65) {
+      /* Mismatch: cannot run ONNX; treat as silence */
+    } else {
+      RNN_COPY(feat65, features, 65);
+      if (st->onnx_ok && st->onnx) {
+        if (onnx_denoiser_forward(st->onnx, feat65, g, &vad_prob) != 0) {
+          st->onnx_ok = 0; /* fallback: zero gains handled below */
+          vad_prob = 0.f;
+          for (i=0;i<NB_BANDS;i++) g[i] = 1.f;
+        }
+      } else {
+        /* ONNX not initialized: pass-through */
+        vad_prob = 0.f;
+        for (i=0;i<NB_BANDS;i++) g[i] = 1.f;
+      }
+    }
+#else
+# if !TRAINING
     compute_rnn(&st->model, &st->rnn, g, &vad_prob, features, st->arch);
+# endif
 #endif
     rnn_pitch_filter(st->delayed_X, st->delayed_P, st->delayed_Ex, st->delayed_Ep, st->delayed_Exp, g);
     for (i=0;i<NB_BANDS;i++) {
@@ -515,4 +551,130 @@ float rnnoise_process_frame_guitar_mask(DenoiseState *st,
 }
 
 int rnnoise_get_band_count() { return NB_BANDS; }
+
+#ifdef RNNOISE_PURE_ONNX
+/* Public helper to load an ONNX model into an existing state (after rnnoise_init). */
+int rnnoise_pure_onnx_load(DenoiseState *st, const char *model_path) {
+  if (!st) return -1;
+  if (st->onnx) {
+    onnx_denoiser_destroy(st->onnx);
+    st->onnx = NULL;
+  }
+  st->onnx = onnx_denoiser_create(model_path);
+  if (!st->onnx) {
+    st->onnx_ok = 0;
+    return -2;
+  }
+  st->onnx_ok = 1;
+  return 0;
+}
+#endif
+
+/* === External Feature Extraction & State Serialization API Implementations === */
+
+int rnnoise_extract_features(DenoiseState *st, const float *in, float *features_out) {
+  if(!st || !in || !features_out) return -1;
+  kiss_fft_cpx X[FREQ_SIZE];
+  kiss_fft_cpx P[FREQ_SIZE];
+  float Ex[NB_BANDS], Ep[NB_BANDS];
+  float Exp[NB_BANDS];
+  float tmp_features[NB_FEATURES];
+  float xhp[FRAME_SIZE];
+  static const float a_hp[2] = {-1.99599f, 0.99600f};
+  static const float b_hp[2] = {-2.f, 1.f};
+  /* High-pass to match internal pipeline */
+  rnn_biquad(xhp, st->mem_hp_x, in, b_hp, a_hp, FRAME_SIZE);
+  int silence = rnn_compute_frame_features(st, X, P, Ex, Ep, Exp, tmp_features, xhp);
+  if(silence) {
+    RNN_CLEAR(features_out, NB_FEATURES);
+    return 1; /* silent */
+  }
+  RNN_COPY(features_out, tmp_features, NB_FEATURES);
+  return 0;
+}
+
+void rnnoise_reset_state(DenoiseState *st) {
+  if(!st) return;
+  memset(st->analysis_mem, 0, sizeof(st->analysis_mem));
+  memset(st->synthesis_mem, 0, sizeof(st->synthesis_mem));
+  memset(st->pitch_buf, 0, sizeof(st->pitch_buf));
+  memset(st->pitch_enh_buf, 0, sizeof(st->pitch_enh_buf));
+  st->last_gain = 0.f;
+  st->last_period = 0;
+  memset(st->mem_hp_x, 0, sizeof(st->mem_hp_x));
+  memset(st->lastg, 0, sizeof(st->lastg));
+  memset(&st->rnn, 0, sizeof(st->rnn));
+  memset(st->delayed_X, 0, sizeof(st->delayed_X));
+  memset(st->delayed_P, 0, sizeof(st->delayed_P));
+  memset(st->delayed_Ex, 0, sizeof(st->delayed_Ex));
+  memset(st->delayed_Ep, 0, sizeof(st->delayed_Ep));
+  memset(st->delayed_Exp, 0, sizeof(st->delayed_Exp));
+#ifdef RNNOISE_PURE_ONNX
+  /* ONNX recurrent state lives inside OnnxDenoiser; resetting is handled by destroying and recreating if needed. */
+#endif
+}
+
+/* Layout definition for serialization: a simple packed struct */
+typedef struct SerializedStateHeader {
+  unsigned char magic[4]; /* 'R','N','S','T' */
+  uint16_t version; /* 1 */
+  uint16_t nb_bands; /* 32 */
+  uint16_t frame_size; /* 480 */
+  uint16_t reserved; /* alignment */
+} SerializedStateHeader;
+
+int rnnoise_get_serialized_state(DenoiseState *st, void *out, int out_bytes) {
+  if(!st) return -1;
+  const int payload_floats = FRAME_SIZE /*analysis_mem*/ + FRAME_SIZE /*synth*/ + PITCH_BUF_SIZE + PITCH_BUF_SIZE /*enh*/ + 1 /*last_gain*/ + 1 /*last_period as float*/ + 2 /*hp mem*/ + NB_BANDS /*lastg*/ + FREQ_SIZE*2 /*delayed_X*/ + FREQ_SIZE*2 /*delayed_P*/ + NB_BANDS*3 /*delayed_Ex/Ep/Exp*/;
+  const int bytes_needed = sizeof(SerializedStateHeader) + payload_floats*sizeof(float);
+  if(!out) return bytes_needed;
+  if(out_bytes < bytes_needed) return -1;
+  unsigned char *ptr = (unsigned char*)out;
+  SerializedStateHeader hdr; memcpy(hdr.magic, "RNST", 4); hdr.version=1; hdr.nb_bands=NB_BANDS; hdr.frame_size=FRAME_SIZE; hdr.reserved=0;
+  memcpy(ptr, &hdr, sizeof(hdr)); ptr += sizeof(hdr);
+  float *fptr = (float*)ptr;
+  memcpy(fptr, st->analysis_mem, sizeof(float)*FRAME_SIZE); fptr += FRAME_SIZE;
+  memcpy(fptr, st->synthesis_mem, sizeof(float)*FRAME_SIZE); fptr += FRAME_SIZE;
+  memcpy(fptr, st->pitch_buf, sizeof(float)*PITCH_BUF_SIZE); fptr += PITCH_BUF_SIZE;
+  memcpy(fptr, st->pitch_enh_buf, sizeof(float)*PITCH_BUF_SIZE); fptr += PITCH_BUF_SIZE;
+  *fptr++ = st->last_gain;
+  *fptr++ = (float)st->last_period;
+  memcpy(fptr, st->mem_hp_x, sizeof(float)*2); fptr += 2;
+  memcpy(fptr, st->lastg, sizeof(float)*NB_BANDS); fptr += NB_BANDS;
+  /* delayed_X and delayed_P complex arrays */
+  for(int i=0;i<FREQ_SIZE;i++) { *fptr++ = st->delayed_X[i].r; *fptr++ = st->delayed_X[i].i; }
+  for(int i=0;i<FREQ_SIZE;i++) { *fptr++ = st->delayed_P[i].r; *fptr++ = st->delayed_P[i].i; }
+  memcpy(fptr, st->delayed_Ex, sizeof(float)*NB_BANDS); fptr += NB_BANDS;
+  memcpy(fptr, st->delayed_Ep, sizeof(float)*NB_BANDS); fptr += NB_BANDS;
+  memcpy(fptr, st->delayed_Exp, sizeof(float)*NB_BANDS); fptr += NB_BANDS;
+  return bytes_needed;
+}
+
+int rnnoise_set_serialized_state(DenoiseState *st, const void *data, int data_bytes) {
+  if(!st || !data) return -1;
+  if(data_bytes < (int)sizeof(SerializedStateHeader)) return -2;
+  const unsigned char *ptr = (const unsigned char*)data;
+  SerializedStateHeader hdr; memcpy(&hdr, ptr, sizeof(hdr)); ptr += sizeof(hdr);
+  if(memcmp(hdr.magic, "RNST", 4)!=0 || hdr.version!=1 || hdr.nb_bands!=NB_BANDS || hdr.frame_size!=FRAME_SIZE) return -3;
+  float *dst;
+  int floats_total = FRAME_SIZE + FRAME_SIZE + PITCH_BUF_SIZE + PITCH_BUF_SIZE + 1 + 1 + 2 + NB_BANDS + FREQ_SIZE*2 + FREQ_SIZE*2 + NB_BANDS*3;
+  int bytes_needed = sizeof(SerializedStateHeader) + floats_total*sizeof(float);
+  if(data_bytes < bytes_needed) return -4;
+  const float *fptr = (const float*)ptr;
+  memcpy(st->analysis_mem, fptr, sizeof(float)*FRAME_SIZE); fptr += FRAME_SIZE;
+  memcpy(st->synthesis_mem, fptr, sizeof(float)*FRAME_SIZE); fptr += FRAME_SIZE;
+  memcpy(st->pitch_buf, fptr, sizeof(float)*PITCH_BUF_SIZE); fptr += PITCH_BUF_SIZE;
+  memcpy(st->pitch_enh_buf, fptr, sizeof(float)*PITCH_BUF_SIZE); fptr += PITCH_BUF_SIZE;
+  st->last_gain = *fptr++;
+  st->last_period = (int)(*fptr++ + 0.5f);
+  memcpy(st->mem_hp_x, fptr, sizeof(float)*2); fptr += 2;
+  memcpy(st->lastg, fptr, sizeof(float)*NB_BANDS); fptr += NB_BANDS;
+  for(int i=0;i<FREQ_SIZE;i++) { st->delayed_X[i].r = *fptr++; st->delayed_X[i].i = *fptr++; }
+  for(int i=0;i<FREQ_SIZE;i++) { st->delayed_P[i].r = *fptr++; st->delayed_P[i].i = *fptr++; }
+  memcpy(st->delayed_Ex, fptr, sizeof(float)*NB_BANDS); fptr += NB_BANDS;
+  memcpy(st->delayed_Ep, fptr, sizeof(float)*NB_BANDS); fptr += NB_BANDS;
+  memcpy(st->delayed_Exp, fptr, sizeof(float)*NB_BANDS); fptr += NB_BANDS;
+  (void)dst;
+  return 0;
+}
 

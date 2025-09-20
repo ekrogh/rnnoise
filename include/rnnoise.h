@@ -115,6 +115,27 @@ RNNOISE_EXPORT float rnnoise_process_frame_guitar_mask(DenoiseState *st,
 RNNOISE_EXPORT int rnnoise_get_band_count();
 
 /**
+ * Extract the 65-dim feature vector (RNNoise baseline: 2*NB_BANDS + 1) from a raw PCM frame without
+ * advancing synthesis or applying gains. The frame length must equal rnnoise_get_frame_size().
+ * Returns 0 on success, non-zero if the internal energy deemed the frame silent (features zeroed).
+ * In PURE_ONNX mode this lets external code run ONNX inference manually while reusing the
+ * proven feature pipeline. 'features_out' must point to an array of 65 floats.
+ */
+RNNOISE_EXPORT int rnnoise_extract_features(DenoiseState *st, const float *in, float *features_out);
+
+/** Reset recurrent network (or ONNX) internal states & smoothing memory (high-pass, gains). */
+RNNOISE_EXPORT void rnnoise_reset_state(DenoiseState *st);
+
+/** Serialize internal recurrent state (gains + pitch + rnn/onnx states) into user buffer.
+ * Returns number of bytes written or required (if out==NULL) so caller can size buffer.
+ * Returns negative on error. Passing a buffer smaller than required returns -1.
+ */
+RNNOISE_EXPORT int rnnoise_get_serialized_state(DenoiseState *st, void *out, int out_bytes);
+
+/** Restore previously serialized state. Returns 0 on success. */
+RNNOISE_EXPORT int rnnoise_set_serialized_state(DenoiseState *st, const void *data, int data_bytes);
+
+/**
  * Load a model from a memory buffer
  *
  * It must be deallocated with rnnoise_model_free() and the buffer must remain

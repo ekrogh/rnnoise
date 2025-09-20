@@ -44,6 +44,10 @@ parser.add_argument('--suffix', type=str, help="model name suffix", default="")
 parser.add_argument('--cuda-visible-devices', type=str, help="comma separates list of cuda visible device indices, default: CUDA_VISIBLE_DEVICES", default=None)
 parser.add_argument('--workers', type=int, help='DataLoader worker processes (Windows default override to 0 if >0)', default=4)
 parser.add_argument('--use-guitar-activity-label', action='store_true', help='If feature file includes extra guitar activity channel (dim=99), use it instead of legacy vad channel')
+parser.add_argument('--export-onnx', type=str, default=None, help='Optional path to export ONNX model after final epoch (e.g. rnnoise.onnx)')
+parser.add_argument('--onnx-opset', type=int, default=17, help='ONNX opset version to use when exporting')
+parser.add_argument('--onnx-no-dynamic', action='store_true', help='Disable dynamic axes (export fixed shapes)')
+parser.add_argument('--onnx-dummy-seq', type=int, default=200, help='Dummy sequence length for ONNX export (only affects exported initial shape)')
 
 
 model_group = parser.add_argument_group(title="model parameters")
@@ -237,3 +241,50 @@ if __name__ == '__main__':
         checkpoint['loss'] = running_loss / len(dataloader)
         checkpoint['epoch'] = epoch
         torch.save(checkpoint, checkpoint_path)
+        if epoch == epochs and args.export_onnx:
+            try:
+                model.eval()
+                # Build export wrapper exposing recurrent states explicitly
+                import torch.nn as nn
+                class _ExportWrapper(nn.Module):
+                    def __init__(self, core):
+                        super().__init__()
+                        self.core = core
+                    def forward(self, features, state1, state2, state3):
+                        gain, vad, states = self.core(features, states=[state1, state2, state3])
+                        return gain, vad, states[0], states[1], states[2]
+
+                wrapper = _ExportWrapper(model).to(device)
+                bsz = 1
+                T = max(1, int(args.onnx_dummy_seq))
+                dummy_feats = torch.randn(bsz, T, 65, device=device)
+                dummy_state = torch.zeros(1, bsz, model.gru_size, device=device)
+                inputs = (dummy_feats, dummy_state, dummy_state, dummy_state)
+                input_names = ['features', 'state1', 'state2', 'state3']
+                output_names = ['gain', 'vad', 'out_state1', 'out_state2', 'out_state3']
+                dynamic_axes = None
+                if not args.onnx_no_dynamic:
+                    dynamic_axes = {
+                        'features': {0: 'batch', 1: 'frames'},
+                        'gain': {0: 'batch', 1: 'frames'},
+                        'vad': {0: 'batch', 1: 'frames'},
+                        'state1': {1: 'batch'},
+                        'state2': {1: 'batch'},
+                        'state3': {1: 'batch'},
+                        'out_state1': {1: 'batch'},
+                        'out_state2': {1: 'batch'},
+                        'out_state3': {1: 'batch'}
+                    }
+                torch.onnx.export(
+                    wrapper,
+                    inputs,
+                    args.export_onnx,
+                    input_names=input_names,
+                    output_names=output_names,
+                    dynamic_axes=dynamic_axes,
+                    opset_version=args.onnx_opset,
+                    do_constant_folding=True,
+                )
+                print(f"[train_rnnoise] Exported ONNX model to {args.export_onnx} (opset={args.onnx_opset}, dynamic={(dynamic_axes is not None)})")
+            except Exception as e:
+                print(f"[train_rnnoise] ONNX export failed: {e}")

@@ -181,3 +181,93 @@ That document covers:
 6. Capability detection and backwards compatibility behavior
 7. Common failure modes & fixes
 8. Environment variable summary
+
+## ONNX Export (Recurrent RNNoise + Guitar Probability)
+
+You can now export the PyTorch RNNoise (extended) model to ONNX either inline at the end of training or from any saved checkpoint.
+
+### A) Export Automatically After Training
+Add flags to the training invocation (e.g. inside pipeline scripts):
+
+```powershell
+python ./torch/rnnoise/train_rnnoise.py features.f32 models `
+	--epochs 5 --batch-size 64 --sequence-length 1200 `
+	--gru-size 256 --cond-size 128 `
+	--export-onnx models/rnnoise_dynamic.onnx --onnx-opset 17
+```
+
+Key flags:
+- `--export-onnx <path>`: write ONNX after final epoch
+- `--onnx-opset`: opset (>=17 recommended)
+- `--onnx-no-dynamic`: if set, disables dynamic axes (fixed batch=1, frames length)
+- `--onnx-dummy-seq`: dummy temporal length for shape (default 200)
+
+### B) Standalone Export from Checkpoint
+
+```powershell
+python ./torch/rnnoise/export_onnx.py `
+	--checkpoint models/checkpoints/rnnoise_30.pth `
+	--out models/rnnoise_dynamic.onnx --opset 17
+```
+
+Outputs (dynamic version) expose recurrent states explicitly:
+Inputs:
+- `features`: (batch, frames, 65)
+- `state1|state2|state3`: (1, batch, gru_size)
+
+Outputs:
+- `gain`: (batch, frames, 32)
+- `vad`: (batch, frames, 1)
+- `out_state1|2|3`: updated recurrent states
+
+If dynamic axes enabled (default): batch & frame length are symbolic. For streaming inference, process one frame at a time: feed `(1,1,65)` and loop passing returned states.
+
+### Minimal Parity Check
+```powershell
+# Python quick check
+python - <<'PY'
+import torch, onnxruntime as ort, numpy as np
+from pathlib import Path
+import rnnoise
+ckpt='models/checkpoints/rnnoise_30.pth'
+model = rnnoise.RNNoise(cond_size=128, gru_size=256)
+sd=torch.load(ckpt,map_location='cpu')['state_dict']; model.load_state_dict(sd, strict=False); model.eval()
+sess=ort.InferenceSession('models/rnnoise_dynamic.onnx', providers=['CPUExecutionProvider'])
+feat=np.random.randn(1,10,65).astype('float32')
+st=np.zeros((1,1,256),dtype='float32')
+g1,v1,ns1=model(torch.from_numpy(feat))
+out=sess.run(None, {'features':feat,'state1':st,'state2':st,'state3':st})
+print('PyTorch gain slice', g1.detach().numpy()[0,0,0:4])
+print('ONNX gain slice  ', out[0][0,0,0:4])
+PY
+```
+Expect close numeric agreement (small tolerance differences from export).
+
+### JUCE / C++ Integration Sketch
+Use ONNX Runtime (or coremltools conversion) for multi-platform deployment:
+
+Pseudo-code:
+```cpp
+// Pseudocode only
+Ort::Session session(env, L"rnnoise_dynamic.onnx", sessionOpts);
+std::array<int64_t,3> featShape{1,1,65};
+std::array<int64_t,3> stShape{1,1,gru};
+// Maintain persistent state tensors (float[gru]) for each GRU layer
+for(each audio frame){
+	// Fill features[65]
+	auto outputs = session.Run(runOpts,
+		inputNames, inputValues, inputCount,
+		outputNames, outputCount);
+	// Apply gain (32 bands) to frame spectrum, update states
+}
+```
+Fallback: retain existing C path if ONNX session creation fails (e.g. dynamic library missing); expose a toggle in UI.
+
+### When to Prefer C Export vs ONNX
+| Use Case | Recommendation |
+| -------- | -------------- |
+| Ultra-low footprint embedded | C weights (current path) |
+| Cross-platform desktop/mobile rapid iteration | ONNX |
+| Need hardware accel (CoreML / NNAPI) | Export ONNX then convert |
+
+See `docs/GUITAR_WORKFLOW.md` ONNX section for deeper parity + streaming notes.

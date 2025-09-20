@@ -141,5 +141,75 @@ Adjust levers:
 - Implement band-wise evaluation metrics (retain guitar spectral centroid energy).
 - Export ONNX for cross-platform inference tests.
 
+## 10. ONNX Export & Streaming Inference
+
+Two paths:
+1. Inline at end of training: add `--export-onnx models/rnnoise.onnx [--onnx-opset 17]` to `train_rnnoise.py` invocation.
+2. Standalone: `python ./torch/rnnoise/export_onnx.py --checkpoint models/checkpoints/rnnoise_30.pth --out models/rnnoise.onnx`.
+
+Exported graph inputs/outputs (dynamic by default):
+Inputs:
+- `features` : (batch, frames, 65)
+- `state1|state2|state3` : (1, batch, gru_size)
+Outputs:
+- `gain` : (batch, frames, 32)
+- `vad` : (batch, frames, 1)
+- `out_state1|2|3` : updated recurrent states
+
+Disable dynamic axes with `--onnx-no-dynamic` (or `--no-dynamic` in standalone script) if you need fixed shapes for constrained runtimes (will freeze batch=1, frames=`--dummy-seq`).
+
+### Streaming (Frame-by-Frame) Loop
+1. Maintain three GRU state buffers (float[gru_size]) initialized to zero.
+2. For each decoded 20 ms frame (RNNoise default 480 samples @ 48 kHz):
+  - Compute / replicate 65-dim feature vector (must match training pipeline features ordering).
+  - Feed `features` with shape (1,1,65) + current states.
+  - Receive `gain` (1,1,32) & new states; overwrite local state buffers.
+  - Apply per-band gain mapping to spectrum -> inverse transform -> overlap-add.
+
+### Parity Validation Steps
+Quick numerical comparison (see README snippet) ensures exported ONNX matches PyTorch reference for a random slice of frames. Accept tiny <1e-4 absolute differences.
+
+Additional recommended checks:
+- Deterministic seed: run identical feature sequence through PyTorch & ONNX => compare final GRU states L2 norm.
+- End-to-end audio: run a short WAV through both pipelines (C vs ONNX) and compute SNR difference of outputs.
+
+### Deployment Decision Matrix
+| Requirement | Choose C Weights | Choose ONNX |
+| ----------- | ---------------- | ----------- |
+| Minimal binary size | ✓ |  |
+| Rapid model iteration (hot-swap) |  | ✓ |
+| Hardware acceleration (CoreML/NNAPI) | (via manual port) | ✓ (convert) |
+| Easiest debugging with Python tools |  | ✓ |
+
+### JUCE Integration Sketch
+Use ONNX Runtime C++ API (ship `onnxruntime` shared lib). Provide fallback to existing C RNNoise path:
+
+Pseudo flow:
+```cpp
+bool useOnnx = tryInitOnnx();
+if(!useOnnx) initCRnnoise();
+
+for(each audio block){
+  while(framesRemaining){
+    extractFrameFeatures(frameBuf, featureVec); // reuse existing feature code or mirror it
+    if(useOnnx){ runOnnx(featureVec, states, gains, prob); }
+    else { runCRnnoise(frameBuf, gains, prob); }
+    applyGains(frameBuf, gains);
+  }
+}
+```
+
+State lifetimes must persist across audio callback invocations (store in member variables, not stack).
+
+### Known Limitations
+- Export currently relies on externally duplicating the 65-dim feature pipeline in your runtime; we do not export feature extraction graph.
+- Gradient-sparsification masks are baked into weights after training; pruning structure remains static in exported model.
+- Activity head optional loss weighting does not change ONNX interface (still outputs `vad`).
+
+### Future Enhancements
+- Provide auxiliary ONNX with feature extraction front-end.
+- Add temporal smoothing node (1D conv) fused into exported graph.
+- Quantization recipe (dynamic or QAT) to shrink runtime memory.
+
 ---
 Feel free to extend this guide as new scripts or metrics emerge.
