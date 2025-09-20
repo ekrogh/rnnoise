@@ -1,133 +1,22 @@
-param(
-  [int]$FeatureCount = 3000,
-  [int]$Epochs = 30,
-  [int]$BatchSize = 64,
-  [switch]$SkipFetch = $false,
-  [string]$GuitarOut = 'E:\rnnoise_data\guitar_clean',
-  [string]$NoiseOut  = 'E:\rnnoise_data\interfere',
-  [string]$TempDownloadDir = 'E:\rnnoise_cache',
-  [string]$GuitarUrls = (Join-Path $PSScriptRoot 'urls_guitar.txt'),
-  [string]$NoiseUrls  = (Join-Path $PSScriptRoot 'urls_noise.txt'),
-  [switch]$PreferMedleyCsv = $true,
-  [string[]]$InstrumentAllowList = @('guitar','electric_guitar','acoustic_guitar'),
-  [switch]$UseParallel = $true,
-  [int]$ParallelJobs = 6,
-  [int]$FfmpegThreadsPerJob = 1,
-  [switch]$IgnoreAppleResourceForks = $true,
-  [switch]$WriteDatasetSummary = $true,
-  [switch]$RunEval = $true,
-  [int]$EvalLimit = 4,
-  # Gating overrides
-  [double]$GateThresh = 0.42,
-  [double]$GateMinScale = 0.10,
-  [double]$GateScaleExp = 2.0,
-  [double]$GateUpDamp = 0.45,
-  [double]$GateSmoothAlpha = 0.60,
-  # Advanced passthrough (rarely changed here)
-  [int]$SequenceLength = 2000,
-  [int]$CondSize = 128,
-  [int]$GruSize = 256,
-  [switch]$CPUOnly = $true,
-  [int]$Workers = 0,
-  [int]$Threads = 0,
-  [int]$MaxConcatSecondsSpeech = 0,
-  [int]$MaxConcatSecondsNoise = 0,
-  [switch]$ForceRegenFeatures = $false,
-  [string]$BuildType = 'Release',
-  [switch]$EvalOnly = $false
-)
-
-<#
-train_rnnoise.ps1
-One-shot convenience wrapper to:
-  1. (Optionally) fetch & filter real guitar + interference datasets to E:\rnnoise_data
-  2. Concatenate to speech.pcm / noise.pcm
-  3. Dump features (cached) up to FeatureCount
-  4. Train PyTorch RNNoise (modified IRM target) for Epochs
-  5. Export weights to C, rebuild with GUITAR_ISOLATION_MODE
-  6. (Optional) Run isolation evaluation
-
-Usage examples:
-  # Default full run (fetch + train + eval)
-  pwsh ./scripts/train_rnnoise.ps1
-
-  # Skip fetching (reuse existing WAV corpus) and adjust epochs/gating
-  pwsh ./scripts/train_rnnoise.ps1 -SkipFetch -Epochs 50 -GateThresh 0.5 -GateMinScale 0.05
-
-Outputs of interest:
-  features.f32
-  models/checkpoints/*.pth
-  src/rnnoise_data.[ch] (updated)
-  build/Release/rnnoise_demo.exe
-  eval_metrics.json (if -RunEval)
-#>
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$PSNativeCommandUseErrorActionPreference = $true
-
-$RepoRoot = Split-Path -Parent $PSScriptRoot
-Write-Host "[train] Repo root: $RepoRoot"
-
-function Invoke-FetchIfNeeded {
-  if ($SkipFetch) { Write-Host '[train] SkipFetch specified; skipping dataset fetch.'; return }
-  $need = $false
-  if (-not (Test-Path $GuitarOut) -or -not (Get-ChildItem $GuitarOut -Recurse -Filter *.wav -ErrorAction SilentlyContinue)) { $need = $true }
-  if (-not (Test-Path $NoiseOut)  -or -not (Get-ChildItem $NoiseOut  -Recurse -Filter *.wav -ErrorAction SilentlyContinue)) { $need = $true }
-  if (-not $need) { Write-Host '[train] Existing WAV data found; skipping fetch.'; return }
-  Write-Host '[train] Fetching real data (guitar + interference)...'
-  $fetch = Join-Path $RepoRoot 'scripts/fetch_real_data.ps1'
-  if (-not (Test-Path $fetch)) { throw "fetch_real_data.ps1 not found at $fetch" }
-  New-Item -ItemType Directory -Force -Path $GuitarOut | Out-Null
-  New-Item -ItemType Directory -Force -Path $NoiseOut  | Out-Null
-  $params = @{
-    GuitarOut = $GuitarOut; NoiseOut = $NoiseOut; TempDownloadDir = $TempDownloadDir;
-    GuitarUrls = $GuitarUrls; NoiseUrls = $NoiseUrls; Downloader = 'Auto'; PreferMedleyCsv = $PreferMedleyCsv;
-    InstrumentAllowList = $InstrumentAllowList; UseParallel = $UseParallel; ParallelJobs = $ParallelJobs;
-    FfmpegThreadsPerJob = $FfmpegThreadsPerJob; IgnoreAppleResourceForks = $IgnoreAppleResourceForks;
-  }
-  if ($WriteDatasetSummary) { $params['WriteDatasetSummary'] = $true }
-  & $fetch @params
-}
-
-Invoke-FetchIfNeeded
-
-# Export gating env vars (runtime; training not affected but evaluation & demo will use them)
-$ci = [System.Globalization.CultureInfo]::InvariantCulture
-$env:RN_GUITAR_GATE_THRESH = $GateThresh.ToString($ci)
-$env:RN_GUITAR_MIN_SCALE   = $GateMinScale.ToString($ci)
-$env:RN_GUITAR_SCALE_EXP   = $GateScaleExp.ToString($ci)
-$env:RN_GUITAR_UP_DAMP     = $GateUpDamp.ToString($ci)
-$env:RN_GUITAR_SMOOTH_ALPHA= $GateSmoothAlpha.ToString($ci)
-Write-Host ("[train] Gating env: thresh={0} min={1} exp={2} up={3} smooth={4}" -f $env:RN_GUITAR_GATE_THRESH,$env:RN_GUITAR_MIN_SCALE,$env:RN_GUITAR_SCALE_EXP,$env:RN_GUITAR_UP_DAMP,$env:RN_GUITAR_SMOOTH_ALPHA)
-
-# Delegate heavy lifting to pipeline script to avoid duplication
-$pipeline = Join-Path $RepoRoot 'scripts/pipeline_guitar.ps1'
-if (-not (Test-Path $pipeline)) { throw "pipeline_guitar.ps1 not found at $pipeline" }
-
-$pipeParams = @{
-  DataMode = 'Real'
-  GuitarDir = $GuitarOut
-  InterfereDir = $NoiseOut
-  FeatureCount = $FeatureCount
-  Epochs = $Epochs
-  BatchSize = $BatchSize
-  SequenceLength = $SequenceLength
-  CondSize = $CondSize
-  GruSize = $GruSize
-  Threads = $Threads
-  MaxConcatSecondsSpeech = $MaxConcatSecondsSpeech
-  MaxConcatSecondsNoise  = $MaxConcatSecondsNoise
-  BuildType = $BuildType
-  EnableGuitarIsolation = $true
-  RunEval = $RunEval
-  EvalLimit = $EvalLimit
-}
-if ($ForceRegenFeatures) { $pipeParams['ForceRegenFeatures'] = $true }
-if (-not $CPUOnly) { $pipeParams['CPUOnly'] = $false }
-if ($EvalOnly) { $pipeParams['EvalOnly'] = $true }
-
-Write-Host '[train] Launching pipeline_guitar.ps1 with named parameters...'
-& $pipeline @pipeParams
-
-Write-Host '[train] Completed.'
+pwsh .\scripts\fetch_real_data.ps1 `
+  -GuitarOut E:\rnnoise_data\guitar_clean `
+  -NoiseOut  E:\rnnoise_data\interfere `
+  -TempDownloadDir E:\rnnoise_cache `
+  -GuitarUrls .\scripts\urls_guitar.txt `
+  -NoiseUrls  .\scripts\urls_noise.txt `
+  -Downloader Auto `
+  -PreferMedleyCsv `
+  -InstrumentAllowList guitar,electric_guitar,acoustic_guitar `
+  -UseParallel `
+  -ParallelJobs 6 `
+  -FfmpegThreadsPerJob 1 `
+  -IgnoreAppleResourceForks `
+  -WriteDatasetSummary
+  
+  pwsh .\scripts\pipeline_guitar.ps1 `
+  -DataMode Real `
+  -GuitarDir E:\rnnoise_data\guitar_clean `
+  -InterfereDir E:\rnnoise_data\interfere `
+  -FeatureCount 3000 -Epochs 30 -BatchSize 64 `
+  -EnableGuitarIsolation -RunEval -EvalLimit 4
+  

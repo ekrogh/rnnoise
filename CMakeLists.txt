@@ -105,7 +105,6 @@ option(BUILD_EXAMPLES "Build examples (rnnoise_demo)" OFF)
 option(BUILD_TOOLS "Build tools (dump_features, dump_weights_blob)" OFF)
 option(ENABLE_SSE4_1 "Enable SSE4.1 optimized sources" OFF)
 option(ENABLE_AVX2 "Enable AVX2 optimized sources" OFF)
-option(GUITAR_ISOLATION_MODE "Enable guitar isolation gating logic in rnnoise_process_frame" OFF)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -118,18 +117,7 @@ if(MSVC)
     add_compile_definitions(_USE_MATH_DEFINES=1 M_PI=3.14159265358979323846)
 endif()
 
-# Resolve location of rnnoise_tables.c (supports LFS relocation)
-set(RNNOISE_TABLES_FILE "")
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/rnnoise_tables.c")
-    set(RNNOISE_TABLES_FILE src/rnnoise_tables.c)
-elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rnnoise_LFS/src/rnnoise_tables.c")
-    set(RNNOISE_TABLES_FILE rnnoise_LFS/src/rnnoise_tables.c)
-    message(STATUS "Using rnnoise_LFS/src/rnnoise_tables.c")
-else()
-    message(FATAL_ERROR "rnnoise_tables.c not found in src/ or rnnoise_LFS/src/. The build cannot proceed.")
-endif()
-
-# Core sources (from the Makefile's RNNOISE_SOURCES) - defer rnnoise_tables.c until after detection
+# Core sources (from the Makefile's RNNOISE_SOURCES)
 set(RNNOISE_SOURCES
     src/denoise.c
     src/rnn.c
@@ -140,7 +128,7 @@ set(RNNOISE_SOURCES
     src/nnet_default.c
     src/parse_lpcnet_weights.c
     src/rnnoise_data.c
-    ${RNNOISE_TABLES_FILE}
+    src/rnnoise_tables.c
 )
 
 # Optional x86 optimized implementations
@@ -161,11 +149,6 @@ add_library(rnnoise STATIC ${RNNOISE_SOURCES})
 target_include_directories(rnnoise PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 target_compile_definitions(rnnoise PRIVATE HAVE_CONFIG_H)
-
-if(GUITAR_ISOLATION_MODE)
-    target_compile_definitions(rnnoise PUBLIC GUITAR_ISOLATION_MODE)
-    message(STATUS "Guitar isolation mode enabled (GUITAR_ISOLATION_MODE=1)")
-endif()
 
 # Xcode: generate only the rnnoise scheme and hide CMake helper schemes
 if(CMAKE_GENERATOR STREQUAL "Xcode")
@@ -246,8 +229,7 @@ endif()
 
 # Tools
 if(BUILD_TOOLS)
-    # Use the resolved ${RNNOISE_TABLES_FILE} so LFS relocation works here too
-    add_executable(dump_features src/dump_features.c src/denoise.c src/pitch.c src/celt_lpc.c src/kiss_fft.c src/parse_lpcnet_weights.c ${RNNOISE_TABLES_FILE})
+    add_executable(dump_features src/dump_features.c src/denoise.c src/pitch.c src/celt_lpc.c src/kiss_fft.c src/parse_lpcnet_weights.c src/rnnoise_tables.c)
     target_compile_definitions(dump_features PRIVATE TRAINING)
     target_link_libraries(dump_features PRIVATE ${CMAKE_DL_LIBS})
 

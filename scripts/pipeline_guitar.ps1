@@ -50,12 +50,14 @@ param(
   [string]$GuitarUrls = (Join-Path $PSScriptRoot 'urls_guitar.txt'),
   [string]$NoiseUrls = (Join-Path $PSScriptRoot 'urls_noise.txt'),
   [switch]$AllowInsecure = $false,
+  # Medley-solos-DB filtering passthrough
   [switch]$PreferMedleyCsv = $true,
   [string[]]$InstrumentAllowList = @('guitar','electric_guitar','acoustic_guitar'),
   [switch]$UseParallel = $true,
   [int]$ParallelJobs = 0,
   [int]$FfmpegThreadsPerJob = 1,
   [switch]$ValidateBeforeConvert = $false,
+  # Pass-through download/convert tuning for fetch_real_data.ps1
   [ValidateSet('Auto','Builtin','Aria2c')][string]$Downloader = 'Auto',
   [switch]$ShowDownloadProgress = $false,
   [double]$MinSeconds = 0,
@@ -63,21 +65,12 @@ param(
   [switch]$WriteDatasetSummary = $false,
   [switch]$IgnoreAppleResourceForks = $true,
   [switch]$PerFileSkipWarnings = $false,
+  # Download/extract cache root (passed to fetch_real_data.ps1). If empty, the fetch script uses %LOCALAPPDATA%\rnnoise_downloads
   [string]$TempDownloadDir = '',
   [int]$Threads = 0,
   [int]$MaxConcatSecondsSpeech = 0,
   [int]$MaxConcatSecondsNoise = 0,
-  [switch]$ForceRegenFeatures = $false,
-  [switch]$EnableGuitarIsolation = $true,
-  [string]$GateThresh = '0.42',
-  [string]$GateMinScale = '0.10',
-  [string]$GateScaleExp = '2.0',
-  [string]$GateUpDamp = '0.45',
-  [string]$GateSmoothAlpha = '0.60',
-  [switch]$RunEval = $false,
-  [int]$EvalLimit = 4,
-  [string]$EvalOutput = 'eval_metrics.json',
-  [switch]$EvalOnly = $false
+  [switch]$ForceRegenFeatures = $false
 )
 
 Set-StrictMode -Version Latest
@@ -105,28 +98,6 @@ Write-Host "  - binaries in build/Release"
 function Require-Cmd($name) {
   if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
     throw "Command '$name' not found in PATH. Please install it."
-  }
-}
-
-# Helper: run isolation evaluation (expects $Py, $RepoRoot, $GuitarIn, gating env already set)
-function Invoke-IsolationEvaluation {
-  param(
-    [int]$Limit,
-    [string]$EvalOutputPath,
-    [string]$InputDirOverride = ''
-  )
-  $evalScript = Join-Path $RepoRoot 'scripts/evaluate_isolation.py'
-  if (-not (Test-Path $evalScript)) {
-    Write-Warning "Evaluation script not found: $evalScript"; return
-  }
-  $evalInputDir = if ($InputDirOverride -and (Test-Path $InputDirOverride)) { $InputDirOverride } elseif (Test-Path $GuitarIn) { $GuitarIn } else { $RepoRoot }
-  $textReport = 'isolation_report.txt'
-  Write-Host "Running evaluation (limit=$Limit) on '$evalInputDir'..."
-  & $Py $evalScript --input-dir $evalInputDir --limit $Limit --json $EvalOutputPath --report $textReport 2>$null
-  if (Test-Path $EvalOutputPath) {
-    Write-Host "Evaluation metrics written to $EvalOutputPath (JSON) and $textReport (text)."
-  } else {
-    Write-Warning "Evaluation output file not produced."
   }
 }
 
@@ -163,10 +134,8 @@ except Exception:
 }
 
 # Resolve input data strategy
-# $DefaultGuitar = Join-Path $RepoRoot 'data/guitar_clean'
-# $DefaultNoise  = Join-Path $RepoRoot 'data/interfere'
-$DefaultGuitar = 'E:\rnnoise_data\guitar_clean'
-$DefaultNoise  = 'E:\rnnoise_data\interfere'
+$DefaultGuitar = Join-Path $RepoRoot 'data/guitar_clean'
+$DefaultNoise  = Join-Path $RepoRoot 'data/interfere'
 
 $UseSynth = $false
 if ($DataMode -eq 'Real' -or ($GuitarDir -ne '' -or $InterfereDir -ne '')) {
@@ -196,33 +165,6 @@ if ($UseSynth -and -not $SkipSynth) {
 
 if (-not (Test-Path $GuitarIn)) { throw "GuitarDir not found: $GuitarIn" }
 if (-not (Test-Path $NoiseIn))  { throw "InterfereDir not found: $NoiseIn" }
-
-# EARLY EVAL-ONLY SHORT-CIRCUIT ---------------------------------------------------------
-if ($EvalOnly) {
-  Write-Host "[EvalOnly] Short-circuit: skipping synthesis/feature dump/training/export."
-  # Ensure build dir & rnnoise_demo exist
-  $BuildDir = Join-Path $RepoRoot 'build'
-  $demoCandidate = Join-Path $BuildDir (Join-Path $BuildType 'rnnoise_demo.exe')
-  if (-not (Test-Path $demoCandidate)) {
-    Write-Host "[EvalOnly] rnnoise_demo not found; configuring minimal build..."
-    cmake -S $RepoRoot -B $BuildDir -DBUILD_EXAMPLES=ON -DBUILD_TOOLS=OFF -DGUITAR_ISOLATION_MODE=ON -DCMAKE_BUILD_TYPE=$BuildType | Out-Null
-    cmake --build $BuildDir --config $BuildType --target rnnoise_demo | Out-Null
-  } else {
-    Write-Host "[EvalOnly] Found existing rnnoise_demo: $demoCandidate"
-  }
-  if ($EnableGuitarIsolation) {
-    $env:RN_GUITAR_GATE_THRESH = $GateThresh
-    $env:RN_GUITAR_MIN_SCALE = $GateMinScale
-    $env:RN_GUITAR_SCALE_EXP = $GateScaleExp
-    $env:RN_GUITAR_UP_DAMP = $GateUpDamp
-    $env:RN_GUITAR_SMOOTH_ALPHA = $GateSmoothAlpha
-    Write-Host ("[EvalOnly] Gating env set: thresh={0} min={1} exp={2} up={3} smooth={4}" -f $GateThresh,$GateMinScale,$GateScaleExp,$GateUpDamp,$GateSmoothAlpha)
-  }
-  Invoke-IsolationEvaluation -Limit $EvalLimit -EvalOutputPath $EvalOutput
-  Write-Host "[EvalOnly] Completed evaluation-only run."
-  Write-Host "Outputs: eval JSON=$EvalOutput, report=isolation_report.txt"
-  return
-}
 
 #
 # Set-PSDebug -Trace 1
@@ -304,7 +246,7 @@ finally { Pop-Location }
 # 5) Build dump_features tool
 $BuildDir = Join-Path $RepoRoot 'build'
 Write-Host "Configuring CMake with tools and examples..."
-cmake -S $RepoRoot -B $BuildDir -DBUILD_TOOLS=ON -DBUILD_EXAMPLES=ON -DGUITAR_ISOLATION_MODE=ON -DCMAKE_BUILD_TYPE=$BuildType | Out-Null
+cmake -S $RepoRoot -B $BuildDir -DBUILD_TOOLS=ON -DBUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=$BuildType | Out-Null
 Write-Host "Building dump_features..."
 cmake --build $BuildDir --config $BuildType --target dump_features | Out-Null
 
@@ -385,19 +327,6 @@ cmake --build $BuildDir --config $BuildType --target rnnoise | Out-Null
 # 9) Build example CLI (rnnoise_demo)
 Write-Host "Building rnnoise_demo example..."
 cmake --build $BuildDir --config $BuildType --target rnnoise_demo | Out-Null
-
-# After building rnnoise_demo add evaluation & gating export
-# Set environment variables for gating if enabled
-if ($EnableGuitarIsolation) {
-  $env:RN_GUITAR_GATE_THRESH = $GateThresh
-  $env:RN_GUITAR_MIN_SCALE = $GateMinScale
-  $env:RN_GUITAR_SCALE_EXP = $GateScaleExp
-  $env:RN_GUITAR_UP_DAMP = $GateUpDamp
-  $env:RN_GUITAR_SMOOTH_ALPHA = $GateSmoothAlpha
-  Write-Host "Guitar isolation gating env vars set: thresh=$GateThresh min=$GateMinScale exp=$GateScaleExp up=$GateUpDamp smooth=$GateSmoothAlpha"
-}
-
-if ($RunEval) { Invoke-IsolationEvaluation -Limit $EvalLimit -EvalOutputPath $EvalOutput }
 
 Write-Host "All done. Outputs:"
 Write-Host " - features: $RepoRoot\features.f32"

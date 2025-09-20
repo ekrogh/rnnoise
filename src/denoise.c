@@ -168,9 +168,20 @@ static void dct(float *out, const float *in) {
     out[i] = sum*sqrt(2./22);
   }
 }
-/* Forward declarations for functions defined later (linker needed). */
-static void apply_window(float *x);
-static void inverse_transform(float *out, const kiss_fft_cpx *in);
+
+#if 0
+static void idct(float *out, const float *in) {
+  int i;
+  for (i=0;i<NB_BANDS;i++) {
+    int j;
+    float sum = 0;
+    for (j=0;j<NB_BANDS;j++) {
+      sum += in[j] * rnn_dct_table[i*NB_BANDS + j];
+    }
+    out[i] = sum*sqrt(2./22);
+  }
+}
+#endif
 
 static void forward_transform(kiss_fft_cpx *out, const float *in) {
   int i;
@@ -186,22 +197,23 @@ static void forward_transform(kiss_fft_cpx *out, const float *in) {
   }
 }
 
-/* Reconstruct full symmetric spectrum and perform inverse FFT. */
 static void inverse_transform(float *out, const kiss_fft_cpx *in) {
   int i;
-  kiss_fft_cpx y[WINDOW_SIZE];
   kiss_fft_cpx x[WINDOW_SIZE];
-  /* Build the symmetric spectrum needed for the inverse real FFT. */
+  kiss_fft_cpx y[WINDOW_SIZE];
   for (i=0;i<FREQ_SIZE;i++) {
-    y[i] = in[i];
-    /* Mirror (excluding the DC bin being mirrored onto the last element twice). */
-    y[WINDOW_SIZE - i - 1].r = in[i].r;
-    y[WINDOW_SIZE - i - 1].i = -in[i].i;
+    x[i] = in[i];
   }
-  /* Nyquist bin should have zero imaginary part for real signals. Ensure conjugate consistency. */
-  y[FREQ_SIZE-1].i = -y[FREQ_SIZE-1].i;
-  rnn_fft(&rnn_kfft, y, x, 1);
-  for (i=0;i<WINDOW_SIZE;i++) out[i] = x[i].r / WINDOW_SIZE;
+  for (;i<WINDOW_SIZE;i++) {
+    x[i].r = x[WINDOW_SIZE - i].r;
+    x[i].i = -x[WINDOW_SIZE - i].i;
+  }
+  rnn_fft(&rnn_kfft, x, y, 0);
+  /* output in reverse order for IFFT. */
+  out[0] = WINDOW_SIZE*y[0].r;
+  for (i=1;i<WINDOW_SIZE;i++) {
+    out[i] = WINDOW_SIZE*y[WINDOW_SIZE - i].r;
+  }
 }
 
 static void apply_window(float *x) {
@@ -296,12 +308,10 @@ int rnnoise_init(DenoiseState *st, RNNModel *model) {
   return 0;
 }
 
-/* Allocate and initialize a DenoiseState. Mirrors original upstream API. */
 DenoiseState *rnnoise_create(RNNModel *model) {
-  DenoiseState *st;
   int ret;
-  st = (DenoiseState*)malloc(rnnoise_get_size());
-  if (st == NULL) return NULL;
+  DenoiseState *st;
+  st = malloc(rnnoise_get_size());
   ret = rnnoise_init(st, model);
   if (ret != 0) {
     free(st);
@@ -466,137 +476,11 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
     compute_rnn(&st->model, &st->rnn, g, &vad_prob, features, st->arch);
 #endif
     rnn_pitch_filter(st->delayed_X, st->delayed_P, st->delayed_Ex, st->delayed_Ep, st->delayed_Exp, g);
-    /* Baseline smoothing using previous gains; do not update lastg yet. */
     for (i=0;i<NB_BANDS;i++) {
-      float alpha = 0.6f;
+      float alpha = .6f;
       g[i] = MAX16(g[i], alpha*st->lastg[i]);
+      st->lastg[i] = g[i];
     }
-#ifdef GUITAR_ISOLATION_MODE
-    /* Guitar isolation gating with runtime-configurable parameters. */
-    {
-      #ifndef GUITAR_GATE_THRESH
-      #define GUITAR_GATE_THRESH 0.40f
-      #endif
-      #ifndef GUITAR_MIN_SCALE
-      #define GUITAR_MIN_SCALE 0.10f
-      #endif
-      #ifndef GUITAR_SCALE_EXP
-      #define GUITAR_SCALE_EXP 2.0f
-      #endif
-      #ifndef GUITAR_UP_DAMP
-      #define GUITAR_UP_DAMP 0.50f
-      #endif
-      #ifndef GUITAR_SMOOTH_ALPHA
-      #define GUITAR_SMOOTH_ALPHA 0.60f
-      #endif
-      static int env_loaded = 0;
-      static float gate_thresh = GUITAR_GATE_THRESH;
-      static float min_scale = GUITAR_MIN_SCALE;
-      static float scale_exp = GUITAR_SCALE_EXP;
-      static float up_damp = GUITAR_UP_DAMP;
-      static float smooth_alpha = GUITAR_SMOOTH_ALPHA;
-      static int bypass_gate = 0; /* 1 => disable guitar gating */
-      static int debug_gate = 0;  /* 1 => print debug info occasionally */
-      static int dbg_counter = 0;
-      static int act_source = 0; /* 0=vad,1=mid,2=blend */
-      static int auto_floor = 0; /* enable adaptive min_scale floor */
-      static float observed_act_sum = 0.f;
-      static int observed_frames = 0;
-      if (!env_loaded) {
-        const char *e;
-        if ((e = getenv("RN_GUITAR_GATE_THRESH"))) gate_thresh = (float)atof(e);
-        if ((e = getenv("RN_GUITAR_MIN_SCALE")))  min_scale   = (float)atof(e);
-        if ((e = getenv("RN_GUITAR_SCALE_EXP")))  scale_exp   = (float)atof(e);
-        if ((e = getenv("RN_GUITAR_UP_DAMP")))    up_damp     = (float)atof(e);
-        if ((e = getenv("RN_GUITAR_SMOOTH_ALPHA"))) smooth_alpha = (float)atof(e);
-        if ((e = getenv("RN_GUITAR_BYPASS"))) bypass_gate = atoi(e)!=0;
-        if ((e = getenv("RN_GUITAR_DEBUG"))) debug_gate = atoi(e)!=0;
-        if ((e = getenv("RN_GUITAR_ACT_SOURCE"))) {
-          if (strcmp(e, "mid") == 0) act_source = 1;
-          else if (strcmp(e, "blend") == 0) act_source = 2;
-          else act_source = 0; /* default to vad */
-        }
-        if ((e = getenv("RN_GUITAR_AUTO_FLOOR"))) auto_floor = atoi(e)!=0;
-        if (gate_thresh < 0.05f) gate_thresh = 0.05f; if (gate_thresh > 0.95f) gate_thresh = 0.95f;
-        if (min_scale < 0.f) min_scale = 0.f; if (min_scale > 0.9f) min_scale = 0.9f;
-        if (scale_exp < 0.5f) scale_exp = 0.5f; if (scale_exp > 5.f) scale_exp = 5.f;
-        if (up_damp < 0.f) up_damp = 0.f; if (up_damp > 1.f) up_damp = 1.f;
-        if (smooth_alpha < 0.f) smooth_alpha = 0.f; if (smooth_alpha > 0.95f) smooth_alpha = 0.95f;
-        env_loaded = 1;
-      }
-      /* Derive mid-band energy ratio (approx guitar presence) if requested */
-      float act_vad = vad_prob;
-      if (act_vad < 0.f) act_vad = 0.f; if (act_vad > 1.f) act_vad = 1.f;
-      float act_mid = act_vad;
-      if (act_source != 0) {
-        /* Mid band ~300-3500 Hz: approximate using band indices overlapping that range. */
-        /* Band edges in eband20ms relate to FFT bin indices (48kHz, 20ms). We approximate.
-           We'll treat bands whose center bin frequency is in the interval as mid. */
-        int mid_lo_hz = 300;
-        int mid_hi_hz = 3500;
-        float mid_energy = 0.f;
-        float total_energy = 0.f;
-        for (i=0;i<NB_BANDS;i++) {
-          /* Approximate center frequency in Hz */
-          int lo = eband20ms[i];
-            int hi = eband20ms[i+1];
-            float center_bin = 0.5f*(lo+hi);
-            float center_hz = (48000.f/2.f) * (center_bin / (float)FREQ_SIZE); /* Nyquist scaled */
-            float e = Ex[i];
-            total_energy += e;
-            if (center_hz >= mid_lo_hz && center_hz <= mid_hi_hz) mid_energy += e;
-        }
-        if (total_energy > 1e-12f) act_mid = mid_energy / total_energy; else act_mid = 0.f;
-        if (act_mid < 0.f) act_mid = 0.f; if (act_mid > 1.f) act_mid = 1.f;
-      }
-      float act;
-      if (act_source == 1) act = act_mid;              /* mid */
-      else if (act_source == 2) act = 0.5f*act_vad + 0.5f*act_mid; /* blend */
-      else act = act_vad; /* vad */
-      /* Adaptive floor: after initial frames, if activation is consistently low, raise min_scale */
-      if (!bypass_gate && auto_floor) {
-        if (observed_frames < 400) { /* ~8 seconds at 50 fps */
-          observed_act_sum += act;
-          observed_frames++;
-          if (observed_frames == 200) {
-            float mean_act = observed_act_sum / observed_frames;
-            if (mean_act < 0.15f && min_scale < 0.30f) {
-              min_scale = 0.30f; /* lift floor */
-            }
-          }
-        }
-      }
-      float scale = 1.f;
-      if (!bypass_gate) {
-        if (act < gate_thresh) {
-          float ratio = act / gate_thresh;
-          float shaped = powf(ratio, scale_exp);
-          scale = min_scale + (1.f - min_scale)*shaped;
-        }
-        for (i=0;i<NB_BANDS;i++) {
-          float prev = st->lastg[i];
-            float cur = g[i];
-            if (scale < 1.f && cur > prev && act < gate_thresh*0.7f) {
-              cur = prev + (cur - prev)*scale*up_damp;
-            } else {
-              cur *= scale;
-            }
-            /* Additional smoothing to prevent sudden expansion */
-            cur = MAX16(cur, smooth_alpha*prev);
-            g[i] = cur;
-        }
-      }
-      if (debug_gate) {
-        dbg_counter++;
-        if ((dbg_counter & 63) == 0) {
-          fprintf(stderr, "[guitar_gate] act=%.3f (vad=%.3f mid=%.3f src=%d) scale=%.3f bypass=%d thresh=%.2f min=%.2f exp=%.2f up=%.2f smooth=%.2f auto_floor=%d\n",
-            act, act_vad, act_mid, act_source, scale, bypass_gate, gate_thresh, min_scale, scale_exp, up_damp, smooth_alpha, auto_floor);
-        }
-      }
-    }
-#endif
-    /* Commit updated gains to memory after gating. */
-    for (i=0;i<NB_BANDS;i++) st->lastg[i] = g[i];
     interp_band_gain(gf, g);
 #if 1
     for (i=0;i<FREQ_SIZE;i++) {
@@ -604,9 +488,6 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
       st->delayed_X[i].i *= gf[i];
     }
 #endif
-  } else {
-    /* Silence frame: decay memory to avoid stale high gains. */
-    for (i=0;i<NB_BANDS;i++) st->lastg[i] *= 0.90f;
   }
   frame_synthesis(st, out, st->delayed_X);
 

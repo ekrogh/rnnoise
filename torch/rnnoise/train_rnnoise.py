@@ -57,9 +57,6 @@ training_group.add_argument('--sequence-length', type=int, help='sequence length
 training_group.add_argument('--lr-decay', type=float, help='learning rate decay factor, default: 5e-5', default=5e-5)
 training_group.add_argument('--initial-checkpoint', type=str, help='initial checkpoint to start training from, default: None', default=None)
 training_group.add_argument('--gamma', type=float, help='perceptual exponent (default 0.1667)', default=0.1667)
-training_group.add_argument('--gamma-low', type=float, help='optional different gamma exponent for low target gains (< low-threshold)', default=None)
-training_group.add_argument('--low-threshold', type=float, help='threshold separating low/high target mask region', default=0.25)
-training_group.add_argument('--mask-focus', type=float, help='extra weighting factor for mid mask range (improves discrimination, default 1.0)', default=1.0)
 
 args = parser.parse_args()
 
@@ -141,9 +138,6 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=adam_betas, eps=a
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer, lr_lambda=lambda x : 1 / (1 + lr_decay * x))
 
 gamma = args.gamma
-gamma_low = args.gamma_low if args.gamma_low is not None else args.gamma
-low_thr = args.low_threshold
-mask_focus = args.mask_focus
 
 if __name__ == '__main__':
     model.to(device)
@@ -166,19 +160,11 @@ if __name__ == '__main__':
                 states = [state.detach() for state in states]
                 gain = gain[:,3:-1,:]
                 vad = vad[:,3:-1,:]
-                # Compute IRM-style loss with ignore mask for negatives
-                raw_target = gain.clone()
-                valid_mask = (raw_target >= 0).float()
-                target_gain = torch.clamp(raw_target, min=0)
-                thr_mask = (target_gain < low_thr).float()
-                eff_gamma = thr_mask*gamma_low + (1-thr_mask)*gamma
-                pred_p = pred_gain.clamp(1e-5,1-1e-5)
-                tgt_p  = target_gain.clamp(1e-5,1-1e-5)
-                base_err = (pred_p**eff_gamma - tgt_p**eff_gamma)**2
-                if mask_focus != 1.0:
-                    mid_w = 1 + (mask_focus-1)*torch.exp(-((tgt_p-0.5)**2)/(2*0.15**2))
-                    base_err = base_err * mid_w
-                gain_loss = torch.sum(base_err * valid_mask) / (valid_mask.sum() + 1e-6)
+                target_gain = torch.clamp(gain, min=0)
+                target_gain = target_gain*(torch.tanh(5*target_gain)**2)
+
+                gain_loss = torch.mean(mask(gain)*(pred_gain**gamma - target_gain**gamma)**2)
+                #vad_loss = torch.mean(torch.abs(2*vad-1)*(vad-pred_vad)**2)
                 vad_loss = torch.mean(torch.abs(2*vad-1)*(-vad*torch.log(.01+pred_vad) - (1-vad)*torch.log(1.01-pred_vad)))
                 loss = gain_loss + .0005*vad_loss
 
