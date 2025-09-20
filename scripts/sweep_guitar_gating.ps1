@@ -4,7 +4,8 @@ param(
   [string]$EvalScript = "scripts/evaluate_isolation.py",
   [int]$Limit = 10,
   [string]$Ext = ".wav",
-  [string]$OutDir = "gating_sweeps"
+  [string]$OutDir = "gating_sweeps",
+  [switch]$Single = $false
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,11 +15,19 @@ if (!(Test-Path $DemoExe)) { Write-Error "Demo exe not found: $DemoExe" }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
-# Parameter grids
-$thresholds = 0.35,0.40,0.45
-$minScales  = 0.05,0.10,0.15
-$exponents  = 1.5,2.0,2.5
-$upDamps    = 0.4,0.5
+# Parameter grids (full vs single quick mode)
+if ($Single) {
+  Write-Host "Using SINGLE quick sweep grid"
+  $thresholds = 0.40
+  $minScales  = 0.10
+  $exponents  = 2.0
+  $upDamps    = 0.5
+} else {
+  $thresholds = 0.35,0.40,0.45
+  $minScales  = 0.05,0.10,0.15
+  $exponents  = 1.5,2.0,2.5
+  $upDamps    = 0.4,0.5
+}
 
 $results = @()
 
@@ -35,7 +44,10 @@ foreach ($t in $thresholds) {
         $env:RN_GUITAR_SCALE_EXP = $e
         $env:RN_GUITAR_UP_DAMP = $u
         # Keep smoothing alpha default from build (can expose later)
-        python $EvalScript --input-dir $InputDir --demo-exe $DemoExe --limit $Limit --ext $Ext --report $reportTxt --json $reportJson | Out-Null
+  # Use repo training venv python if present, else fallback to 'python'
+  $py = 'D:/venvs/rnnoise312/Scripts/python.exe'
+  if (-not (Test-Path $py)) { $py = 'python' }
+  & $py $EvalScript --input-dir $InputDir --demo-exe $DemoExe --limit $Limit --ext $Ext --report $reportTxt --json $reportJson | Out-Null
         if (Test-Path $reportJson) {
           $json = Get-Content $reportJson -Raw | ConvertFrom-Json
           if ($json.Length -gt 0) {

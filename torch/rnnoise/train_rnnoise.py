@@ -43,6 +43,7 @@ parser.add_argument('output', type=str, help='path to output folder')
 parser.add_argument('--suffix', type=str, help="model name suffix", default="")
 parser.add_argument('--cuda-visible-devices', type=str, help="comma separates list of cuda visible device indices, default: CUDA_VISIBLE_DEVICES", default=None)
 parser.add_argument('--workers', type=int, help='DataLoader worker processes (Windows default override to 0 if >0)', default=4)
+parser.add_argument('--use-guitar-activity-label', action='store_true', help='If feature file includes extra guitar activity channel (dim=99), use it instead of legacy vad channel')
 
 
 model_group = parser.add_argument_group(title="model parameters")
@@ -57,6 +58,9 @@ training_group.add_argument('--sequence-length', type=int, help='sequence length
 training_group.add_argument('--lr-decay', type=float, help='learning rate decay factor, default: 5e-5', default=5e-5)
 training_group.add_argument('--initial-checkpoint', type=str, help='initial checkpoint to start training from, default: None', default=None)
 training_group.add_argument('--gamma', type=float, help='perceptual exponent (default 0.1667)', default=0.1667)
+training_group.add_argument('--activity-loss-weight', type=float, help='weight for activity (VAD/guitar prob) loss (default 0.0005)', default=0.0005)
+training_group.add_argument('--disable-activity-head', action='store_true', help='disable activity probability loss/head (still runs model but zero weight)')
+training_group.add_argument('--save-batch-interval', type=int, help='Save partial checkpoint every N batches (0=disable)', default=0)
 
 args = parser.parse_args()
 
@@ -68,20 +72,39 @@ class RNNoiseDataset(torch.utils.data.Dataset):
                 sequence_length=2000):
 
         self.sequence_length = sequence_length
-
         self.data = np.memmap(features_file, dtype='float32', mode='r')
-        dim = 98
+        # Infer dimensionality: prefer new 99 (65 feats + 32 gains + 1 vad + 1 guitar) over legacy 98
+        candidates = []
+        for d in (99, 98):
+            total_frames = self.data.shape[0] / d
+            if abs(total_frames - int(total_frames)) < 1e-6:
+                candidates.append((d, int(total_frames)))
+        if not candidates:
+            raise ValueError(f"Unable to infer feature dimension from file size={self.data.shape[0]}; expected multiple of 98 or 99")
+        # If both match (rare but possible when length is LCM multiple), pick higher dimension (new format)
+        self.dim, frames = sorted(candidates, key=lambda x: (-x[0], -x[1]))[0]
 
-        self.nb_sequences = self.data.shape[0]//self.sequence_length//dim
-        self.data = self.data[:self.nb_sequences*self.sequence_length*dim]
-
-        self.data = np.reshape(self.data, (self.nb_sequences, self.sequence_length, dim))
+        self.nb_sequences = self.data.shape[0]//(self.sequence_length*self.dim)
+        self.data = self.data[:self.nb_sequences*self.sequence_length*self.dim]
+        self.data = np.reshape(self.data, (self.nb_sequences, self.sequence_length, self.dim))
 
     def __len__(self):
         return self.nb_sequences
 
     def __getitem__(self, index):
-        return self.data[index, :, :65].copy(), self.data[index, :, 65:-1].copy(), self.data[index, :, -1:].copy()
+        # Layout (legacy 98): [65 feat][32 gains][1 vad]
+        # Layout (new 99):    [65 feat][32 gains][1 vad][1 guitar_prob]
+        if self.dim == 98:
+            feats = self.data[index, :, :65]
+            gains = self.data[index, :, 65:-1]
+            vad = self.data[index, :, -1:]
+            guitar = vad  # no separate channel
+        else:  # 99
+            feats = self.data[index, :, :65]
+            gains = self.data[index, :, 65:-2]
+            vad = self.data[index, :, -2:-1]
+            guitar = self.data[index, :, -1:]
+        return feats.copy(), gains.copy(), vad.copy(), guitar.copy()
 
 def mask(g):
     return torch.clamp(g+1, max=1)
@@ -114,6 +137,7 @@ if type(args.initial_checkpoint) != type(None):
 checkpoint['state_dict']    = model.state_dict()
 
 dataset = RNNoiseDataset(args.features)
+print(f"[train_rnnoise] Detected feature dimension={dataset.dim} (frames per sequence candidate)")
 workers = args.workers
 import platform
 if platform.system().lower().startswith('win') and workers > 0:
@@ -142,31 +166,43 @@ gamma = args.gamma
 if __name__ == '__main__':
     model.to(device)
     states = None
+    save_batch_interval = max(0, int(args.save_batch_interval))
     for epoch in range(1, epochs + 1):
-
         running_gain_loss = 0
         running_vad_loss = 0
         running_loss = 0
 
         print(f"training epoch {epoch}...")
         with tqdm.tqdm(dataloader, unit='batch') as tepoch:
-            for i, (features, gain, vad) in enumerate(tepoch):
+            for i, batch in enumerate(tepoch):
+                # Backward compatibility: batch may have 3 or 4 tensors
+                if len(batch) == 3:
+                    features, gain, vad = batch
+                    guitar = vad
+                else:
+                    features, gain, vad, guitar = batch
                 optimizer.zero_grad()
                 features = features.to(device)
                 gain = gain.to(device)
                 vad = vad.to(device)
+                guitar = guitar.to(device)
 
                 pred_gain, pred_vad, states = model(features, states=states)
                 states = [state.detach() for state in states]
                 gain = gain[:,3:-1,:]
                 vad = vad[:,3:-1,:]
+                guitar = guitar[:,3:-1,:]
                 target_gain = torch.clamp(gain, min=0)
                 target_gain = target_gain*(torch.tanh(5*target_gain)**2)
 
                 gain_loss = torch.mean(mask(gain)*(pred_gain**gamma - target_gain**gamma)**2)
                 #vad_loss = torch.mean(torch.abs(2*vad-1)*(vad-pred_vad)**2)
-                vad_loss = torch.mean(torch.abs(2*vad-1)*(-vad*torch.log(.01+pred_vad) - (1-vad)*torch.log(1.01-pred_vad)))
-                loss = gain_loss + .0005*vad_loss
+                # Choose which activity label to supervise against
+                activity_label = guitar if (args.use_guitar_activity_label and dataset.dim == 99) else vad
+                vad_loss = torch.mean(torch.abs(2*activity_label-1)*(-activity_label*torch.log(.01+pred_vad) - (1-activity_label)*torch.log(1.01-pred_vad)))
+                # Optionally disable or reweight activity loss
+                activity_w = 0.0 if args.disable_activity_head else args.activity_loss_weight
+                loss = gain_loss + activity_w*vad_loss
 
                 loss.backward()
                 optimizer.step()
@@ -179,8 +215,21 @@ if __name__ == '__main__':
                 running_loss += loss.detach().cpu().item()
                 tepoch.set_postfix(loss=f"{running_loss/(i+1):8.5f}",
                                    gain_loss=f"{running_gain_loss/(i+1):8.5f}",
-                                   vad_loss=f"{running_vad_loss/(i+1):8.5f}",
-                                   )
+                                   vad_loss=(f"{running_vad_loss/(i+1):8.5f}" if activity_w>0 else 'disabled'),
+                                   act_w=f"{activity_w}")
+
+                if save_batch_interval > 0 and (i+1) % save_batch_interval == 0:
+                    # Partial checkpoint inside epoch
+                    partial_path = os.path.join(checkpoint_dir, f'rnnoise{args.suffix}_ep{epoch}_b{i+1}.pth')
+                    checkpoint['state_dict'] = model.state_dict()
+                    checkpoint['loss'] = running_loss / (i+1)
+                    checkpoint['epoch'] = epoch
+                    checkpoint['batch'] = i+1
+                    torch.save(checkpoint, partial_path)
+                    if (i+1) == save_batch_interval:
+                        print(f"[train_rnnoise] Saved first partial checkpoint: {partial_path}")
+                    else:
+                        print(f"[train_rnnoise] Saved partial checkpoint: {partial_path}")
 
         # save checkpoint
         checkpoint_path = os.path.join(checkpoint_dir, f'rnnoise{args.suffix}_{epoch}.pth')

@@ -225,9 +225,10 @@ int main(int argc, char **argv) {
     kiss_fft_cpx X[FREQ_SIZE], Y[FREQ_SIZE], P[WINDOW_SIZE];
     float Ex[NB_BANDS], Ey[NB_BANDS], Ep[NB_BANDS];
     float Exp[NB_BANDS];
-    float features[NB_FEATURES];
+  float features[NB_FEATURES];
     float g[NB_BANDS];
     float speech_rms, noise_rms;
+  float prev_guitar_prob = 0.f; /* smoothing state */
     if ((count%1000)==0) fprintf(stderr, "%d\r", count);
     speech_pos = (rand_lcg(&seed)*2.3283e-10)*speech_length;
     noise_pos = (rand_lcg(&seed)*2.3283e-10)*noise_length;
@@ -305,7 +306,8 @@ int main(int argc, char **argv) {
       rir_filter_sequence(&rirs, xn, rir_id, 0);
     }
     for (frame=0;frame<SEQUENCE_LENGTH;frame++) {
-      float vad;
+  float vad;
+  float guitar_prob; /* new guitar-focused activity label based on band energy ratio */
       float E0, Eprev, Enext;
       rnn_frame_analysis(st, Y, Ey, &x[frame*FRAME_SIZE]);
       silence = rnn_compute_frame_features(noisy, X, P, Ex, Ep, Exp, features, &xn[frame*FRAME_SIZE]);
@@ -332,9 +334,20 @@ int main(int argc, char **argv) {
       }
 #endif
 #if 1
+      /* Compute guitar probability as ratio of clean speech band energy to mixed band energy, smoothed */
+      {
+        float sumEy = 0.f, sumEx = 0.f;
+        for (i=0;i<NB_BANDS;i++) { sumEy += Ey[i]; sumEx += Ex[i]; }
+        float ratio = sumEy/(1e-3f + sumEx);
+        if (ratio < 0.f) ratio = 0.f; if (ratio > 1.f) ratio = 1.f;
+        /* Exponential smoothing to reduce label noise */
+        guitar_prob = 0.6f*prev_guitar_prob + 0.4f*ratio;
+        prev_guitar_prob = guitar_prob;
+      }
       fwrite(features, sizeof(float), NB_FEATURES, fout);
       fwrite(g, sizeof(float), NB_BANDS, fout);
       fwrite(&vad, sizeof(float), 1, fout);
+      fwrite(&guitar_prob, sizeof(float), 1, fout);
 #endif
     }
   }

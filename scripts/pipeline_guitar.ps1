@@ -71,11 +71,22 @@ param(
   [int]$MaxConcatSecondsSpeech = 0,
   [int]$MaxConcatSecondsNoise = 0,
   [switch]$ForceRegenFeatures = $false
+  , [double]$ActivityLossWeight = 0.0005
+  , [string]$Suffix = ''
+  , [switch]$UseGuitarActivityLabel = $false
+  , [string]$AlbumDirForEval = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
+
+Write-Host "[debug] Param summary:" -ForegroundColor Cyan
+Get-Variable -Scope Local | Where-Object { $_.Name -in @(
+  'FeatureCount','Epochs','BatchSize','SequenceLength','Workers','CudaVisibleDevices','CondSize','GruSize','BuildType',
+  'CPUOnly','DataMode','GuitarDir','InterfereDir','FetchFromUrls','MusanMode','ActivityLossWeight','Suffix','UseGuitarActivityLabel',
+  'AlbumDirForEval','MaxConcatSecondsSpeech','MaxConcatSecondsNoise','ForceRegenFeatures') } |
+  ForEach-Object { Write-Host ("[debug]  {0} = {1}" -f $_.Name, $_.Value) }
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Write-Host "Repo root: $RepoRoot"
@@ -305,6 +316,10 @@ if ($Workers -ge 0) { $trainArgs += @('--workers', "$Workers") }
 if ($CondSize -gt 0) { $trainArgs += @('--cond-size', "$CondSize") }
 if ($GruSize -gt 0) { $trainArgs += @('--gru-size', "$GruSize") }
 if ($CudaVisibleDevices -ne '') { $trainArgs += @('--cuda-visible-devices', $CudaVisibleDevices) }
+if ($ActivityLossWeight -ne $null) { $trainArgs += @('--activity-loss-weight', "$ActivityLossWeight") }
+if ($UseGuitarActivityLabel) { $trainArgs += @('--use-guitar-activity-label') }
+if ($Suffix) { $trainArgs += @('--suffix', $Suffix) }
+if ($Epochs -ge 1) { $trainArgs += @('--save-batch-interval','0') }
 & $Py @trainArgs
 
 # 8) Export weights to C and rebuild rnnoise
@@ -327,6 +342,21 @@ cmake --build $BuildDir --config $BuildType --target rnnoise | Out-Null
 # 9) Build example CLI (rnnoise_demo)
 Write-Host "Building rnnoise_demo example..."
 cmake --build $BuildDir --config $BuildType --target rnnoise_demo | Out-Null
+if (Test-Path (Join-Path $BuildDir (Join-Path $BuildType 'eks_rnnoise_demo.exe'))) {
+  Write-Host "eks_rnnoise_demo already built earlier or via examples target."
+} else {
+  try { cmake --build $BuildDir --config $BuildType --target eks_rnnoise_demo | Out-Null } catch { Write-Warning "Could not build eks_rnnoise_demo target (may not exist)." }
+}
+
+if ($AlbumDirForEval -and (Test-Path $AlbumDirForEval)) {
+  Write-Host "Running album evaluation on $AlbumDirForEval after training..."
+  $albumEval = Join-Path $RepoRoot 'scripts/album_eval.ps1'
+  if (Test-Path $albumEval) {
+    pwsh -File $albumEval -AlbumDir $AlbumDirForEval | Out-Null
+  } else {
+    Write-Warning "album_eval.ps1 not found; skipping post-train evaluation."
+  }
+}
 
 Write-Host "All done. Outputs:"
 Write-Host " - features: $RepoRoot\features.f32"

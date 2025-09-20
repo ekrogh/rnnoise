@@ -225,6 +225,13 @@ endif()
 if(BUILD_EXAMPLES)
     add_executable(rnnoise_demo examples/rnnoise_demo.c)
     target_link_libraries(rnnoise_demo PRIVATE rnnoise)
+    # Extended experimental demo with background isolator and guitar mask draft API
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/eks_rnnoise_demo.c")
+        add_executable(eks_rnnoise_demo examples/eks_rnnoise_demo.c)
+        target_link_libraries(eks_rnnoise_demo PRIVATE rnnoise)
+        # Define flag so code can conditionally compile features if desired
+        target_compile_definitions(eks_rnnoise_demo PRIVATE RNNOISE_EXPERIMENTAL_EKS_DEMO=1)
+    endif()
 endif()
 
 # Tools

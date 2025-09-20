@@ -454,7 +454,7 @@ void rnn_pitch_filter(kiss_fft_cpx *X, const kiss_fft_cpx *P, const float *Ex, c
   }
 }
 
-float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
+static float rnnoise_internal_process_frame(DenoiseState *st, float *out, const float *in, float *out_gains, int out_gains_len) {
   int i;
   kiss_fft_cpx X[FREQ_SIZE];
   kiss_fft_cpx P[FREQ_SIZE];
@@ -496,6 +496,23 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
   RNN_COPY(st->delayed_Ex, Ex, NB_BANDS);
   RNN_COPY(st->delayed_Ep, Ep, NB_BANDS);
   RNN_COPY(st->delayed_Exp, Exp, NB_BANDS);
+  if (out_gains && out_gains_len >= NB_BANDS) {
+    for (i=0;i<NB_BANDS;i++) out_gains[i] = g[i];
+  }
   return vad_prob;
 }
+
+float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
+  return rnnoise_internal_process_frame(st, out, in, NULL, 0);
+}
+
+float rnnoise_process_frame_guitar_mask(DenoiseState *st,
+                                        float *out,
+                                        const float *in,
+                                        float *band_gains,
+                                        int band_gains_len) {
+  return rnnoise_internal_process_frame(st, out, in, band_gains, band_gains_len);
+}
+
+int rnnoise_get_band_count() { return NB_BANDS; }
 

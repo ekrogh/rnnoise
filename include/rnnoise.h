@@ -94,6 +94,27 @@ RNNOISE_EXPORT void rnnoise_destroy(DenoiseState *st);
 RNNOISE_EXPORT float rnnoise_process_frame(DenoiseState *st, float *out, const float *in);
 
 /**
+ * Extended processing variant for guitar isolation experiments.
+ *
+ * Behaves like rnnoise_process_frame but optionally copies the per-band
+ * smoothed gains applied during the most recent frame into band_gains
+ * (length must be >= rnnoise_get_band_count()). Returns the same VAD/
+ * activity probability as the base function (repurposed as guitar prob
+ * in isolation mode).
+ *
+ * If band_gains is NULL or band_gains_len is insufficient, the gains
+ * are not written.
+ */
+RNNOISE_EXPORT float rnnoise_process_frame_guitar_mask(DenoiseState *st,
+                                                       float *out,
+                                                       const float *in,
+                                                       float *band_gains,
+                                                       int band_gains_len);
+
+/** Return the number of critical bands (gain elements) exposed. */
+RNNOISE_EXPORT int rnnoise_get_band_count();
+
+/**
  * Load a model from a memory buffer
  *
  * It must be deallocated with rnnoise_model_free() and the buffer must remain

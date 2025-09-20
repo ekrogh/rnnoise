@@ -26,7 +26,14 @@ param(
   [string]$InterfereDir = '',
   [switch]$FetchFromUrls = $false,
   [string]$TempDownloadDir = '',
-  [ValidateSet('All','NoiseOnly')][string]$MusanMode = 'All'
+  [ValidateSet('All','NoiseOnly')][string]$MusanMode = 'All',
+  [double]$ActivityLossWeight = 0.0005,
+  [string]$Suffix = '',
+  [switch]$UseGuitarActivityLabel = $false,
+  [string]$AlbumDirForEval = '',
+  [int]$MaxConcatSecondsSpeech = 0,
+  [int]$MaxConcatSecondsNoise = 0,
+  [switch]$ForceRegenFeatures = $false
 )
 
 Set-StrictMode -Version Latest
@@ -82,6 +89,13 @@ if ($DataMode -eq 'Real') {
 if ($FetchFromUrls) { $p['FetchFromUrls'] = $true }
 if ($TempDownloadDir -and $TempDownloadDir.Trim() -ne '') { $p['TempDownloadDir'] = $TempDownloadDir }
 if ($MusanMode) { $p['MusanMode'] = $MusanMode }
+if ($ActivityLossWeight -ne $null) { $p['ActivityLossWeight'] = $ActivityLossWeight }
+if ($Suffix) { $p['Suffix'] = $Suffix }
+if ($UseGuitarActivityLabel) { $p['UseGuitarActivityLabel'] = $true }
+if ($AlbumDirForEval) { $p['AlbumDirForEval'] = $AlbumDirForEval }
+if ($MaxConcatSecondsSpeech -gt 0) { $p['MaxConcatSecondsSpeech'] = $MaxConcatSecondsSpeech }
+if ($MaxConcatSecondsNoise -gt 0) { $p['MaxConcatSecondsNoise'] = $MaxConcatSecondsNoise }
+if ($ForceRegenFeatures) { $p['ForceRegenFeatures'] = $true }
 
 # Execute pipeline and tee output to log
 & $pipe @p *>&1 | Tee-Object -FilePath $Log -Append
