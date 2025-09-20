@@ -88,7 +88,10 @@ struct DenoiseState {
   int last_period;
   float mem_hp_x[2];
   float lastg[NB_BANDS];
+  /* RNN state only needed in embedded (non-PURE_ONNX) mode */
+#ifndef RNNOISE_PURE_ONNX
   RNNState rnn;
+#endif
   kiss_fft_cpx delayed_X[FREQ_SIZE];
   kiss_fft_cpx delayed_P[FREQ_SIZE];
   float delayed_Ex[NB_BANDS], delayed_Ep[NB_BANDS];
@@ -603,7 +606,9 @@ void rnnoise_reset_state(DenoiseState *st) {
   st->last_period = 0;
   memset(st->mem_hp_x, 0, sizeof(st->mem_hp_x));
   memset(st->lastg, 0, sizeof(st->lastg));
+#ifndef RNNOISE_PURE_ONNX
   memset(&st->rnn, 0, sizeof(st->rnn));
+#endif
   memset(st->delayed_X, 0, sizeof(st->delayed_X));
   memset(st->delayed_P, 0, sizeof(st->delayed_P));
   memset(st->delayed_Ex, 0, sizeof(st->delayed_Ex));
