@@ -1,4 +1,0 @@
-[submodule "rnnoise_LFS"]
-	path = rnnoise_LFS
-	url = \\\\BUFFALO\\share\\GIT_Root\\machineLearning\\rnnoise_LFS
-	branch = main
