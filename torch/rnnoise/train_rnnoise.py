@@ -48,6 +48,9 @@ parser.add_argument('--export-onnx', type=str, default=None, help='Optional path
 parser.add_argument('--onnx-opset', type=int, default=17, help='ONNX opset version to use when exporting')
 parser.add_argument('--onnx-no-dynamic', action='store_true', help='Disable dynamic axes (export fixed shapes)')
 parser.add_argument('--onnx-dummy-seq', type=int, default=200, help='Dummy sequence length for ONNX export (only affects exported initial shape)')
+parser.add_argument('--force-cpu', action='store_true', help='Force CPU training even if CUDA is available')
+parser.add_argument('--warmup-batch-size', type=int, default=0, help='Optional one-time smaller batch size for first iteration (0=disabled)')
+parser.add_argument('--warmup-seq-len', type=int, default=0, help='Optional one-time shorter sequence length for first iteration (0=disabled)')
 
 
 model_group = parser.add_argument_group(title="model parameters")
@@ -128,7 +131,21 @@ checkpoint_dir = os.path.join(args.output, 'checkpoints')
 os.makedirs(checkpoint_dir, exist_ok=True)
 checkpoint = dict()
 
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+disable_cudnn_env = os.environ.get('DISABLE_CUDNN') == '1'
+if disable_cudnn_env:
+    torch.backends.cudnn.enabled = False
+
+device = torch.device("cuda") if (torch.cuda.is_available() and not disable_cudnn_env and not False and not None) else torch.device("cpu")
+if args.force_cpu:
+    device = torch.device('cpu')
+print(f"[train_rnnoise] Device selected: {device}, cuda_available={torch.cuda.is_available()}, cudnn_enabled={torch.backends.cudnn.enabled}, force_cpu={args.force_cpu}")
+print(f"[train_rnnoise] Device selected: {device}, cuda_available={torch.cuda.is_available()}, cudnn_enabled={torch.backends.cudnn.enabled}")
+if torch.cuda.is_available():
+    try:
+        print(f"[train_rnnoise] CUDA device name: {torch.cuda.get_device_name(0)}")
+        torch.cuda.empty_cache()
+    except Exception as _e:
+        print(f"[train_rnnoise] Warning: unable to query CUDA device name: {_e}")
 
 checkpoint['model_args']    = ()
 checkpoint['model_kwargs']  = {'cond_size': cond_size, 'gru_size': gru_size}
@@ -171,6 +188,7 @@ if __name__ == '__main__':
     model.to(device)
     states = None
     save_batch_interval = max(0, int(args.save_batch_interval))
+    warmup_done = False
     for epoch in range(1, epochs + 1):
         running_gain_loss = 0
         running_vad_loss = 0
@@ -185,6 +203,19 @@ if __name__ == '__main__':
                     guitar = vad
                 else:
                     features, gain, vad, guitar = batch
+                # Optional warmup modifications only for very first batch overall
+                if not warmup_done and i == 0:
+                    if args.warmup_batch_size > 0 and features.size(0) > args.warmup_batch_size:
+                        features = features[:args.warmup_batch_size]
+                        gain = gain[:args.warmup_batch_size]
+                        vad = vad[:args.warmup_batch_size]
+                        guitar = guitar[:args.warmup_batch_size]
+                    if args.warmup_seq_len > 0 and features.size(1) > args.warmup_seq_len:
+                        features = features[:, :args.warmup_seq_len]
+                        gain = gain[:, :args.warmup_seq_len]
+                        vad = vad[:, :args.warmup_seq_len]
+                        guitar = guitar[:, :args.warmup_seq_len]
+                    warmup_done = True
                 optimizer.zero_grad()
                 features = features.to(device)
                 gain = gain.to(device)
@@ -208,7 +239,70 @@ if __name__ == '__main__':
                 activity_w = 0.0 if args.disable_activity_head else args.activity_loss_weight
                 loss = gain_loss + activity_w*vad_loss
 
-                loss.backward()
+                try:
+                    loss.backward()
+                except RuntimeError as rt_err:
+                    print(f"[train_rnnoise] Backward pass error at epoch={epoch} batch={i}: {rt_err}")
+                    fallback_success = False
+                    if device.type == 'cuda':
+                        print('[train_rnnoise] Attempting safe GPU -> CPU fallback (resetting optimizer, states).')
+                        # Try to sync to surface any latent errors; ignore if it fails.
+                        try:
+                            torch.cuda.synchronize()
+                        except Exception as _se:
+                            print(f"[train_rnnoise] cuda.synchronize() failed (ignored): {_se}")
+                        # Capture state_dict if possible
+                        sd = None
+                        try:
+                            sd = {k: v.detach().cpu() for k,v in model.state_dict().items()}
+                        except Exception as _sd_e:
+                            print(f"[train_rnnoise] Could not snapshot GPU state_dict (continuing with fresh model): {_sd_e}")
+                        # Move tensors to CPU (guard each)
+                        def to_cpu_safe(t):
+                            try:
+                                return t.detach().cpu()
+                            except Exception as _tc_e:
+                                print(f"[train_rnnoise] Tensor CPU transfer failed (will re-generate): {_tc_e}")
+                                return None
+                        features = to_cpu_safe(features) or features.new_tensor(features.cpu())
+                        gain = to_cpu_safe(gain) or gain.new_tensor(gain.cpu())
+                        vad = to_cpu_safe(vad) or vad.new_tensor(vad.cpu())
+                        guitar = to_cpu_safe(guitar) or guitar.new_tensor(guitar.cpu())
+                        states = None  # Reset recurrent states after device fault
+                        # Rebuild model fresh on CPU
+                        try:
+                            cpu_model = rnnoise.RNNoise(*checkpoint['model_args'], **checkpoint['model_kwargs'])
+                            if sd is not None:
+                                missing, unexpected = cpu_model.load_state_dict(sd, strict=False)
+                                if missing or unexpected:
+                                    print(f"[train_rnnoise] Warning: state load missing={missing} unexpected={unexpected}")
+                            model = cpu_model
+                            device = torch.device('cpu')
+                            torch.backends.cudnn.enabled = False
+                            # Rebuild optimizer & scheduler for CPU params (retain LR progression via scheduler.last_epoch)
+                            last_epoch = scheduler.last_epoch if 'scheduler' in locals() else -1
+                            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=adam_betas, eps=adam_eps)
+                            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer, lr_lambda=lambda x : 1 / (1 + lr_decay * x))
+                            # Advance scheduler to previous epoch *approx* progress
+                            for _k in range(last_epoch + 1):
+                                scheduler.step()
+                            optimizer.zero_grad(set_to_none=True)
+                            # Recompute forward on CPU
+                            pred_gain, pred_vad, states = model(features, states=None)
+                            gain_loss = torch.mean(mask(gain)*(pred_gain**gamma - target_gain**gamma)**2)
+                            activity_label = guitar if (args.use_guitar_activity_label and dataset.dim == 99) else vad
+                            vad_loss = torch.mean(torch.abs(2*activity_label-1)*(-activity_label*torch.log(.01+pred_vad) - (1-activity_label)*torch.log(1.01-pred_vad)))
+                            activity_w = 0.0 if args.disable_activity_head else args.activity_loss_weight
+                            loss = gain_loss + activity_w*vad_loss
+                            loss.backward()
+                            fallback_success = True
+                            print('[train_rnnoise] CPU fallback succeeded; continuing training on CPU.')
+                        except Exception as fb_e:
+                            print(f"[train_rnnoise] CPU fallback failed: {fb_e}")
+                            fallback_success = False
+                    if not fallback_success:
+                        print('[train_rnnoise] Aborting due to unrecoverable backward error.')
+                        raise
                 optimizer.step()
                 model.sparsify()
 
@@ -245,7 +339,6 @@ if __name__ == '__main__':
             try:
                 model.eval()
                 # Build export wrapper exposing recurrent states explicitly
-                import torch.nn as nn
                 class _ExportWrapper(nn.Module):
                     def __init__(self, core):
                         super().__init__()

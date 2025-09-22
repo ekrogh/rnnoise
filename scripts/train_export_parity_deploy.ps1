@@ -53,7 +53,13 @@ param(
   # Directory containing training Python package (default 'torch' but recommend renaming to avoid PyTorch shadowing)
   [string]$TrainDir = 'torch',
   # Prefer installing / using a CUDA-enabled PyTorch build (falls back to CPU automatically)
-  [switch]$PreferGPU
+  [switch]$PreferGPU,
+  # Force CPU training even if CUDA available / requested
+  [switch]$ForceCPU,
+  # Optional override for CUDA wheel channel (e.g. cu121, cu124, cu126). Falls back to env CUDA_WHEEL_CHANNEL then cu121.
+  [string]$CudaChannel = "",
+  # Optional torch version pin (e.g. 2.7.1). If installed version mismatches, force reinstall.
+  [string]$TorchVersion = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -149,44 +155,105 @@ if($AutoInstallDeps) {
     exit 1
   }
   # Attempt to distinguish between real PyTorch and local 'torch' folder (name collision) and optionally install CUDA build
-  $wantGpu = $PreferGPU -or [bool]$env:USE_GPU
+  $wantGpu = (-not $ForceCPU) -and ($PreferGPU -or [bool]$env:USE_GPU)
+  $requireGpu = [bool]$env:REQUIRE_GPU -or ($PSBoundParameters.ContainsKey('RequireGPU') -and $RequireGPU)
+  # Resolve desired CUDA channel (param > env > default)
+  $resolvedCudaChannel = if($CudaChannel){ $CudaChannel } elseif($env:CUDA_WHEEL_CHANNEL){ $env:CUDA_WHEEL_CHANNEL } else { 'cu121' }
+  if($CudaChannel){ $env:CUDA_WHEEL_CHANNEL = $CudaChannel }
+  if($TorchVersion){ Write-Host "Torch version pin requested: $TorchVersion" -ForegroundColor DarkCyan }
   & $PythonExe -c "import sys,os; import torch; import types; ok = all(hasattr(torch,a) for a in ('__version__','nn','tensor')); print('TORCH_STATUS', 'OK' if ok else 'PLACEHOLDER', getattr(torch,'__file__',None)); sys.exit(0 if ok else 1)" 2>$null
   if($LASTEXITCODE -ne 0) {
     if($wantGpu) {
-      Write-Host "Trying CUDA PyTorch wheel (cu121)" -ForegroundColor Yellow
-      if($VerboseDeps) { & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/cu121 }
-      else { & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/cu121 | Out-Null }
+      $gpuLog = Join-Path $OutputDir "gpu_install.log"
+      Write-Host "Attempting CUDA wheel installs (log: $gpuLog)" -ForegroundColor Yellow
+      $channels = @()
+      if($CudaChannel){ $channels += $CudaChannel }
+      $channels += @('cu126','cu125','cu124','cu121','cu118') | Where-Object { $_ -ne $CudaChannel }
+      $tried = @()
+      foreach($ch in $channels) {
+        Write-Host "[GPU-INSTALL] Trying channel $ch" -ForegroundColor DarkYellow
+        $start = Get-Date
+        $line = "Channel=$ch Version=$TorchVersion Start=$start"
+        Add-Content -Path $gpuLog -Value $line
+        if($TorchVersion){
+          & $PythonExe -m pip install torch==$TorchVersion --index-url https://download.pytorch.org/whl/$ch 2>&1 | Add-Content -Path $gpuLog
+        } else {
+          & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/$ch 2>&1 | Add-Content -Path $gpuLog
+        }
+        & $PythonExe -c "import torch,sys; sys.exit(0 if hasattr(torch,'cuda') and torch.cuda.is_available() else 1)" 2>$null
+        $dur = (Get-Date) - $start
+        Add-Content -Path $gpuLog -Value ("Result exit=$LASTEXITCODE Duration={0:n2}s" -f $dur.TotalSeconds)
+        if($LASTEXITCODE -eq 0) { Write-Host "[GPU-INSTALL] Success on $ch" -ForegroundColor Green; break }
+        $tried += $ch
+      }
+      if($LASTEXITCODE -ne 0) { Write-Host "GPU wheel attempts failed (tried: $($channels -join ', '))" -ForegroundColor Yellow }
     }
     # Test import after possible CUDA attempt
     & $PythonExe -c "import torch,sys; sys.exit(0 if hasattr(torch,'nn') else 1)" 2>$null
     if($LASTEXITCODE -ne 0) {
       Write-Host "Falling back to CPU PyTorch wheel" -ForegroundColor Yellow
-      if($VerboseDeps) { & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/cpu }
-      else { & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/cpu | Out-Null }
+      if($TorchVersion){
+        if($VerboseDeps) { & $PythonExe -m pip install torch==$TorchVersion --index-url https://download.pytorch.org/whl/cpu }
+        else { & $PythonExe -m pip install torch==$TorchVersion --index-url https://download.pytorch.org/whl/cpu | Out-Null }
+      } else {
+        if($VerboseDeps) { & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/cpu }
+        else { & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/cpu | Out-Null }
+      }
     }
     # Final fallback generic index
     & $PythonExe -c "import torch,sys; sys.exit(0 if hasattr(torch,'nn') else 1)" 2>$null
     if($LASTEXITCODE -ne 0) {
       Write-Host "Generic index fallback attempt..." -ForegroundColor Yellow
-      if($VerboseDeps) { & $PythonExe -m pip install torch --upgrade }
-      else { & $PythonExe -m pip install torch --upgrade | Out-Null }
+      if($TorchVersion){
+        if($VerboseDeps) { & $PythonExe -m pip install torch==$TorchVersion }
+        else { & $PythonExe -m pip install torch==$TorchVersion | Out-Null }
+      } else {
+        if($VerboseDeps) { & $PythonExe -m pip install torch --upgrade }
+        else { & $PythonExe -m pip install torch --upgrade | Out-Null }
+      }
     }
   }
   # Diagnostics
   & $PythonExe -c "import torch; print('TORCH_FINAL', getattr(torch,'__version__','?'), 'cuda_avail', torch.cuda.is_available())" 2>$null
   if($wantGpu) { & $PythonExe -c "import torch; import sys; print('CUDA_DEVICE', (torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a'))" 2>$null }
+  # Enforce version pin if mismatch
+  if($TorchVersion){
+    $ver = & $PythonExe -c "import torch,sys; print(torch.__version__)"
+    $normVer = ($ver -split '\+')[0].Trim()
+    $normWant = ($TorchVersion -split '\+')[0].Trim()
+    if($normVer -ne $normWant){
+      Write-Host "Torch version mismatch (have $ver want $TorchVersion) -> force reinstall" -ForegroundColor Yellow
+      if($wantGpu){
+        if($VerboseDeps) { & $PythonExe -m pip install --force-reinstall --no-cache-dir torch==$TorchVersion --index-url https://download.pytorch.org/whl/$resolvedCudaChannel }
+        else { & $PythonExe -m pip install --force-reinstall --no-cache-dir torch==$TorchVersion --index-url https://download.pytorch.org/whl/$resolvedCudaChannel | Out-Null }
+      } else {
+        if($VerboseDeps) { & $PythonExe -m pip install --force-reinstall --no-cache-dir torch==$TorchVersion --index-url https://download.pytorch.org/whl/cpu }
+        else { & $PythonExe -m pip install --force-reinstall --no-cache-dir torch==$TorchVersion --index-url https://download.pytorch.org/whl/cpu | Out-Null }
+      }
+      & $PythonExe -c "import torch; print('TORCH_PINNED', torch.__version__, 'cuda_avail', torch.cuda.is_available())" 2>$null
+    }
+  }
 
   # Remedial attempt: user prefers GPU but current install lacks CUDA; force reinstall CUDA wheel
   if($wantGpu) {
     & $PythonExe -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>$null
     if($LASTEXITCODE -ne 0) {
-      $cudaChannel = if($env:CUDA_WHEEL_CHANNEL) { $env:CUDA_WHEEL_CHANNEL } else { 'cu121' }
-      Write-Host "CUDA not available after initial install. Forcing reinstall from channel '$cudaChannel'." -ForegroundColor Yellow
-      if($VerboseDeps) { & $PythonExe -m pip install --force-reinstall --no-cache-dir torch --index-url https://download.pytorch.org/whl/$cudaChannel }
-      else { & $PythonExe -m pip install --force-reinstall --no-cache-dir torch --index-url https://download.pytorch.org/whl/$cudaChannel | Out-Null }
+      $cudaChannel = if($CudaChannel){ $CudaChannel } elseif($env:CUDA_WHEEL_CHANNEL){ $env:CUDA_WHEEL_CHANNEL } else { 'cu121' }
+      Write-Host "CUDA not available after initial install. Forcing reinstall from channel '$cudaChannel' (resolved=$cudaChannel)." -ForegroundColor Yellow
+      if($TorchVersion){
+        if($VerboseDeps) { & $PythonExe -m pip install --force-reinstall --no-cache-dir torch==$TorchVersion --index-url https://download.pytorch.org/whl/$cudaChannel }
+        else { & $PythonExe -m pip install --force-reinstall --no-cache-dir torch==$TorchVersion --index-url https://download.pytorch.org/whl/$cudaChannel | Out-Null }
+      } else {
+        if($VerboseDeps) { & $PythonExe -m pip install --force-reinstall --no-cache-dir torch --index-url https://download.pytorch.org/whl/$cudaChannel }
+        else { & $PythonExe -m pip install --force-reinstall --no-cache-dir torch --index-url https://download.pytorch.org/whl/$cudaChannel | Out-Null }
+      }
       & $PythonExe -c "import torch; print('TORCH_RECHECK', getattr(torch,'__version__','?'), 'cuda_avail', torch.cuda.is_available())" 2>$null
       & $PythonExe -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>$null
       if($LASTEXITCODE -ne 0) {
+        if($requireGpu){
+          Write-Host "ERROR: CUDA required (--RequireGPU / REQUIRE_GPU=1) but still unavailable after reinstall." -ForegroundColor Red
+          exit 2
+        }
         Write-Host "WARNING: CUDA still unavailable. Proceeding with CPU training." -ForegroundColor Yellow
       } else {
         & $PythonExe -c "import torch; print('CUDA_DEVICE', (torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a'))" 2>$null
@@ -272,6 +339,11 @@ $trainArgs = @(
   "--gru-size", $GruSize,
   "--activity-loss-weight", $activityLossInvariant
 )
+# Map env overrides for batch size / sequence length
+if($env:BATCH_SIZE){ $trainArgs += @('--batch-size', [int]$env:BATCH_SIZE) }
+if($env:SEQ_LEN){ $trainArgs += @('--sequence-length', [int]$env:SEQ_LEN) }
+if($ForceCPU -or [bool]$env:FORCE_CPU){ $trainArgs += '--force-cpu' }
+if([bool]$env:DISABLE_CUDNN){ $env:DISABLE_CUDNN = '1' }
 if($DisableActivityHead) { $trainArgs += "--disable-activity-head" }
 if($UseGuitarActivityLabel) { $trainArgs += "--use-guitar-activity-label" }
 

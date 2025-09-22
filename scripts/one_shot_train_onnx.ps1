@@ -106,6 +106,10 @@ ${paramsPipeline} = [ordered]@{
 }
 if($force -or $full){ $paramsPipeline.RunParity = $true }
 if([bool]$env:USE_GPU){ $paramsPipeline.PreferGPU = $true }
+if([bool]$env:FORCE_CPU){ $paramsPipeline.ForceCPU = $true }
+if($env:TORCH_VERSION){ $paramsPipeline.TorchVersion = $env:TORCH_VERSION }
+if($env:CUDA_WHEEL_CHANNEL){ $paramsPipeline.CudaChannel = $env:CUDA_WHEEL_CHANNEL }
+if([bool]$env:REQUIRE_GPU){ $paramsPipeline.RequireGPU = $true }
 
 $argString = ($paramsPipeline.GetEnumerator() | ForEach-Object { "-$($_.Key) $($_.Value)" }) -join ' '
 Write-Host "[one-shot] Invoking pipeline (splat): & $script $argString" -ForegroundColor DarkGray

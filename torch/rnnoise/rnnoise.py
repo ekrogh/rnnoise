@@ -63,8 +63,10 @@ class RNNoise(nn.Module):
         self.output_dim = output_dim
         self.cond_size = cond_size
         self.gru_size = gru_size
-        self.conv1 = nn.Conv1d(input_dim, cond_size, kernel_size=3, padding='valid')
-        self.conv2 = nn.Conv1d(cond_size, gru_size, kernel_size=3, padding='valid')
+        # NOTE: padding='valid' is not a supported keyword value for nn.Conv1d; use explicit integer (0 here).
+        # Using an unsupported string could trigger backend (cuDNN) internal errors on some builds.
+        self.conv1 = nn.Conv1d(input_dim, cond_size, kernel_size=3, padding=0)
+        self.conv2 = nn.Conv1d(cond_size, gru_size, kernel_size=3, padding=0)
         self.gru1 = nn.GRU(self.gru_size, self.gru_size, batch_first=True)
         self.gru2 = nn.GRU(self.gru_size, self.gru_size, batch_first=True)
         self.gru3 = nn.GRU(self.gru_size, self.gru_size, batch_first=True)
